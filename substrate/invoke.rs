@@ -580,6 +580,24 @@ pub fn mo_resize(mo: Cap, new_page_count: u64) -> i32 {
     invoke(mo, MO_RESIZE, new_page_count, 0, 0, 0).error as i32
 }
 
+/// Read bytes from a committed MemoryObject range into the caller IPC buffer.
+pub fn mo_read(mo: Cap, offset: u64, count: u64) -> (i32, u64) {
+    let r = invoke(mo, MO_READ, offset, count, 0, 0);
+    (r.error as i32, r.value)
+}
+
+/// Write bytes from the caller IPC buffer into a committed MemoryObject range.
+pub fn mo_write(mo: Cap, offset: u64, count: u64) -> (i32, u64) {
+    let r = invoke(mo, MO_WRITE, offset, count, 0, 0);
+    (r.error as i32, r.value)
+}
+
+/// Return whether a page already resolves in this MemoryObject or any COW ancestor.
+pub fn mo_has_page(mo: Cap, page_index: u64) -> (i32, bool) {
+    let r = invoke(mo, MO_HAS_PAGE, page_index, 0, 0, 0);
+    (r.error as i32, r.value != 0)
+}
+
 /// Map a range of pages from a MemoryObject into a VSpace.
 /// `mo_cap` is the MemoryObject capability.
 /// `vaddr` is the target virtual address (page-aligned).

@@ -117,7 +117,7 @@ pub const IOPORT_OUT32: u64 = 0x75;
 pub const IOPORT_CONFIGURE: u64 = 0x76;
 pub const IOPORT_CREATE: u64 = 0x77;
 
-/// MemoryObject invoke labels (0x90-0x96): commit, decommit, get_size, clone, resize, read, write.
+/// MemoryObject invoke labels (0x90-0x97): commit, decommit, get_size, clone, resize, read, write, page query.
 pub const MO_COMMIT: u64 = 0x90;
 pub const MO_DECOMMIT: u64 = 0x91;
 pub const MO_GET_SIZE: u64 = 0x92;
@@ -125,6 +125,7 @@ pub const MO_CLONE: u64 = 0x93;
 pub const MO_RESIZE: u64 = 0x94;
 pub const MO_READ: u64 = 0x95;
 pub const MO_WRITE: u64 = 0x96;
+pub const MO_HAS_PAGE: u64 = 0x97;
 /// VSpace invoke labels for MemoryObject mapping (0x97-0x98).
 pub const VSPACE_MAP_MO: u64 = 0x97;
 pub const VSPACE_UNMAP_MO: u64 = 0x98;
@@ -345,6 +346,15 @@ pub const POSIX_VFS_GETSOCKNAME: u64 = 66;
 pub const POSIX_VFS_GETPEERNAME: u64 = 67;
 pub const POSIX_VFS_SETSOCKOPT: u64 = 68;
 pub const POSIX_VFS_GETSOCKOPT: u64 = 69;
+pub const POSIX_VFS_MMAP_PAGEIN: u64 = 70;
+pub const POSIX_VFS_MMAP_WRITEBACK: u64 = 71;
+
+pub const MMAP_BACKING_NONE: u64 = 0;
+pub const MMAP_BACKING_FILE: u64 = 1;
+pub const MMAP_BACKING_MOUNT: u64 = 2;
+
+pub const MMAP_OBJECT_OPT_LAZY: u64 = 1 << 0;
+pub const MMAP_OBJECT_OPT_WRITEBACK: u64 = 1 << 1;
 
 /// Per-client bulk SHM size for VFS I/O (1MB = 256 pages).
 pub const BULK_SHM_PAGES: u64 = 256;
@@ -470,6 +480,7 @@ pub const POSIX_PM_UMASK: u64 = 30;
 pub const POSIX_PM_REQUEST_UNTYPED: u64 = 31;
 pub const POSIX_PM_SETITIMER: u64 = 32;
 pub const POSIX_PM_GETITIMER: u64 = 33;
+pub const POSIX_PM_GET_EXE_PATH: u64 = 34;
 // Deterministic CNode slots for CSpace expansion (root slots 1008-1015)
 pub const CSPACE_EXPAND_BASE: u64 = 1008;
 pub const MAX_CSPACE_EXPANSIONS: usize = 8;
@@ -494,6 +505,10 @@ pub const MM_FREE_THREAD_OBJECTS: u64 = 0x8F;
 pub const MM_GET_CLIENT_STATS: u64 = 0x90;
 pub const MM_ALLOC_OBJECT: u64 = 0x91;
 pub const MM_REGISTER_SHARED_REGION: u64 = 0x92;
+pub const MM_MAP_OBJECT_REGION: u64 = 0x93;
+pub const MM_SYNC_FILE_BACKING: u64 = 0x94;
+
+pub const MM_SYNC_BACKING_TRUNCATE: u64 = 1 << 0;
 
 /// Name service IPC protocol labels (register/lookup endpoint by name).
 pub const POSIX_NS_REGISTER: u64 = 1;

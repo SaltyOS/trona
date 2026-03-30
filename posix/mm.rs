@@ -147,7 +147,7 @@ pub unsafe fn posix_sbrk(increment: i64) -> u64 {
 /// fd-backed mmap: sends POSIX_VFS_MMAP to VFS, receives device untyped cap,
 /// then maps it locally with write-combining flags.
 unsafe fn posix_mmap_fd(
-    _addr: *mut u8,
+    addr: *mut u8,
     length: u64,
     _prot: i32,
     _flags: i32,
@@ -186,12 +186,13 @@ unsafe fn posix_mmap_fd(
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
         msg.label = POSIX_VFS_MMAP;
-        msg.length = 5;
+        msg.length = 6;
         msg.regs[0] = fd as u64;
         msg.regs[1] = offset as u64;
         msg.regs[2] = len;
         msg.regs[3] = _prot as u64;
         msg.regs[4] = _flags as u64;
+        msg.regs[5] = addr as u64;
 
         let err = ipc::call_ctx(
             crate::tls::current_ipc_ctx(),
