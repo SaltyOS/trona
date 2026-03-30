@@ -233,13 +233,20 @@ pub unsafe fn posix_pread(fd: i32, buf: *mut u8, count: u64, offset: i64) -> i64
 /// Write up to `count` bytes to `fd` at `offset` without changing the file offset.
 ///
 /// Uses a dedicated VFS PWRITE protocol so the server handles the offset
-/// atomically without touching the fd cursor.
+/// atomically without touching the fd cursor. Large writes attempt the bulk
+/// SHM path first and fall back to inline IPC when unavailable.
 /// Returns the number of bytes written, or a negative errno on error.
 pub unsafe fn posix_pwrite(fd: i32, buf: *const u8, count: u64, offset: i64) -> i64 {
     if offset < 0 {
         return -22; // EINVAL
     }
     unsafe {
+        if count > 4096 {
+            if let Some(n) = super::bulk::bulk_pwrite(fd, buf, count, offset as u64) {
+                return n as i64;
+            }
+        }
+
         let mut total: u64 = 0;
 
         while total < count {

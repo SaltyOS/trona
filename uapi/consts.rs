@@ -348,6 +348,7 @@ pub const POSIX_VFS_SETSOCKOPT: u64 = 68;
 pub const POSIX_VFS_GETSOCKOPT: u64 = 69;
 pub const POSIX_VFS_MMAP_PAGEIN: u64 = 70;
 pub const POSIX_VFS_MMAP_WRITEBACK: u64 = 71;
+pub const POSIX_VFS_BULK_PWRITE: u64 = 72;
 
 pub const MMAP_BACKING_NONE: u64 = 0;
 pub const MMAP_BACKING_FILE: u64 = 1;

@@ -142,3 +142,59 @@ pub(crate) unsafe fn bulk_read(fd: i32, buf: *mut u8, count: u64) -> Option<usiz
         Some(total as usize)
     }
 }
+
+/// Bulk pwrite via SHM. Returns bytes written, or None if not available.
+pub(crate) unsafe fn bulk_pwrite(fd: i32, buf: *const u8, count: u64, offset: u64) -> Option<usize> {
+    unsafe {
+        if !ensure_bulk_shm() {
+            return None;
+        }
+
+        let shm_addr = *(&raw const BULK_SHM_ADDR);
+        let shm_size = BULK_SHM_PAGES * 4096;
+        let ctx = crate::tls::current_ipc_ctx();
+        let vfs_ep = super::CAP_VFS_EP;
+        let mut total = 0u64;
+
+        while total < count {
+            let chunk = (count - total).min(shm_size);
+            core::ptr::copy_nonoverlapping(
+                buf.add(total as usize),
+                shm_addr as *mut u8,
+                chunk as usize,
+            );
+
+            let mut msg = TronaMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
+            msg.label = POSIX_VFS_BULK_PWRITE;
+            msg.regs[0] = fd as u64;
+            msg.regs[1] = chunk;
+            msg.regs[2] = match offset.checked_add(total) {
+                Some(v) => v,
+                None => return if total > 0 { Some(total as usize) } else { None },
+            };
+            msg.regs[3] = 0; // shm_offset
+            msg.length = 4;
+
+            let err = ipc::call_ctx(ctx, vfs_ep, &raw const msg, &raw mut reply);
+            if err != 0 || reply.label != TRONA_OK {
+                if total > 0 {
+                    return Some(total as usize);
+                }
+                return None;
+            }
+
+            let wrote = reply.regs[0];
+            if wrote == 0 {
+                break;
+            }
+
+            total += wrote;
+            if wrote < chunk {
+                break;
+            }
+        }
+
+        Some(total as usize)
+    }
+}
