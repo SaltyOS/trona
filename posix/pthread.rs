@@ -466,8 +466,7 @@ pub unsafe fn pthread_create(
         msg.label = MM_ALLOC_THREAD_OBJECTS;
         msg.length = 0;
 
-        let err = ipc::call_ctx(
-            tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             CAP_MMSRV_EP,
             &raw const msg,
             &raw mut reply,

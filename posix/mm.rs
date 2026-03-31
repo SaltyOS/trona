@@ -104,8 +104,7 @@ pub unsafe fn posix_brk(addr: u64) -> i32 {
         msg.label = MM_BRK;
         msg.length = 1;
         msg.regs[0] = addr;
-        let err = ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             *(&raw const MMSRV_EP),
             &raw const msg,
             &raw mut reply,
@@ -126,8 +125,7 @@ pub unsafe fn posix_sbrk(increment: i64) -> u64 {
         msg.label = MM_SBRK;
         msg.length = 1;
         msg.regs[0] = increment as u64;
-        let err = ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             *(&raw const MMSRV_EP),
             &raw const msg,
             &raw mut reply,
@@ -194,12 +192,7 @@ unsafe fn posix_mmap_fd(
         msg.regs[4] = _flags as u64;
         msg.regs[5] = addr as u64;
 
-        let err = ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_VFS_EP,
-            &raw const msg,
-            &raw mut reply,
-        );
+        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
             invoke::cnode_delete(CAP_SELF_CSPACE, recv_slot);
             return usize::MAX as *mut u8;
@@ -324,8 +317,7 @@ pub unsafe fn posix_mmap(
         msg.regs[1] = length;
         msg.regs[2] = prot as u64;
         msg.regs[3] = flags as u64;
-        let err = ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             *(&raw const MMSRV_EP),
             &raw const msg,
             &raw mut reply,
@@ -377,8 +369,7 @@ pub unsafe fn posix_munmap(addr: *mut u8, length: u64) -> i32 {
         msg.length = 2;
         msg.regs[0] = base;
         msg.regs[1] = length;
-        let err = ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             *(&raw const MMSRV_EP),
             &raw const msg,
             &raw mut reply,
@@ -401,8 +392,7 @@ pub unsafe fn posix_mprotect(addr: *mut u8, length: u64, prot: i32) -> i32 {
         msg.regs[0] = addr as u64;
         msg.regs[1] = length;
         msg.regs[2] = prot as u64;
-        let err = ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             *(&raw const MMSRV_EP),
             &raw const msg,
             &raw mut reply,

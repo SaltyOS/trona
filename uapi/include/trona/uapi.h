@@ -46,7 +46,8 @@ enum trona_error {
     TRONA_BUSY = 7,
     TRONA_ALREADY_EXISTS = 8,
     TRONA_WOULD_BLOCK = 9,
-    TRONA_IN_PROGRESS = 15,
+    TRONA_INTERRUPTED = 15,
+    TRONA_IN_PROGRESS = 0x10,
 };
 
 #ifdef __cplusplus

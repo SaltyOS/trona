@@ -37,8 +37,6 @@ unsafe fn ensure_bulk_shm() -> bool {
             return false;
         }
 
-        let ctx = crate::tls::current_ipc_ctx();
-
         // Use badge-derived SHM ID (unique per process)
         let shm_id = super::proc::posix_getpid() as u64 | 0x42_0000_0000;
 
@@ -49,7 +47,7 @@ unsafe fn ensure_bulk_shm() -> bool {
         msg.regs[0] = shm_id;
         msg.regs[1] = BULK_SHM_PAGES;
         msg.length = 2;
-        ipc::call_ctx(ctx, mmsrv_ep, &raw const msg, &raw mut reply);
+        crate::ipc_call_retry(mmsrv_ep, &raw const msg, &raw mut reply);
         if reply.label != TRONA_OK && reply.label != TRONA_ALREADY_EXISTS {
             return false;
         }
@@ -63,7 +61,7 @@ unsafe fn ensure_bulk_shm() -> bool {
         msg.regs[2] = 0; // auto-place
         msg.regs[3] = 0x3; // RW
         msg.length = 4;
-        ipc::call_ctx(ctx, mmsrv_ep, &raw const msg, &raw mut reply);
+        crate::ipc_call_retry(mmsrv_ep, &raw const msg, &raw mut reply);
         if reply.label != TRONA_OK {
             return false;
         }
@@ -76,7 +74,7 @@ unsafe fn ensure_bulk_shm() -> bool {
         msg.regs[0] = shm_id;
         msg.regs[1] = BULK_SHM_PAGES;
         msg.length = 2;
-        ipc::call_ctx(ctx, vfs_ep, &raw const msg, &raw mut reply);
+        crate::ipc_call_retry(vfs_ep, &raw const msg, &raw mut reply);
         if reply.label != TRONA_OK {
             // Non-fatal: fall back to legacy reads
             return false;
@@ -113,7 +111,10 @@ pub(crate) unsafe fn bulk_read(fd: i32, buf: *mut u8, count: u64) -> Option<usiz
             msg.regs[2] = 0; // shm_offset
             msg.length = 3;
 
-            let err = ipc::call_ctx(ctx, vfs_ep, &raw const msg, &raw mut reply);
+            let err = crate::ipc_call_retry(vfs_ep, &raw const msg, &raw mut reply);
+            if err == TRONA_INTERRUPTED as i32 {
+                return None; // fall back to legacy path for EINTR handling
+            }
             if err != 0 || reply.label != TRONA_OK {
                 if total > 0 {
                     return Some(total as usize);
@@ -176,7 +177,10 @@ pub(crate) unsafe fn bulk_pwrite(fd: i32, buf: *const u8, count: u64, offset: u6
             msg.regs[3] = 0; // shm_offset
             msg.length = 4;
 
-            let err = ipc::call_ctx(ctx, vfs_ep, &raw const msg, &raw mut reply);
+            let err = crate::ipc_call_retry(vfs_ep, &raw const msg, &raw mut reply);
+            if err == TRONA_INTERRUPTED as i32 {
+                return None; // fall back to legacy path for EINTR handling
+            }
             if err != 0 || reply.label != TRONA_OK {
                 if total > 0 {
                     return Some(total as usize);

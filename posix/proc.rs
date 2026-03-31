@@ -43,8 +43,7 @@ pub unsafe fn posix_exit(status: i32) -> ! {
         // so the child stays in ReplyWait until TCB_SUSPEND moves it to Inactive.
         // This avoids the yield-loop that starves SCHED_IPC_LOCK on SMP.
         let mut reply = TronaMsg::zeroed();
-        trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        crate::ipc_call_retry(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
@@ -64,14 +63,13 @@ pub unsafe fn posix_getpid() -> i32 {
         msg.label = POSIX_PM_GETPID;
         msg.length = 0;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -88,14 +86,13 @@ pub unsafe fn posix_getppid() -> i32 {
         msg.label = POSIX_PM_GETPPID;
         msg.length = 0;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -111,30 +108,44 @@ pub unsafe fn posix_getppid() -> i32 {
 /// Returns -1 on error.
 pub unsafe fn posix_waitpid3(pid: i32, status: *mut i32, options: i32) -> i32 {
     unsafe {
-        let mut msg = TronaMsg::zeroed();
-        let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_WAIT;
-        msg.length = 2;
-        msg.regs[0] = pid as u32 as u64;
-        msg.regs[1] = options as u64;
+        loop {
+            let mut msg = TronaMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
+            msg.label = POSIX_PM_WAIT;
+            msg.length = 2;
+            msg.regs[0] = pid as u32 as u64;
+            msg.regs[1] = options as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_PROCMGR_EP,
-            &raw const msg,
-            &raw mut reply,
-        );
-        if err != 0 {
-            return -5; // EIO
-        }
-        if reply.label != TRONA_OK {
-            return super::trona_err_to_posix(reply.label);
-        }
+            let err = trona::ipc::call_ctx(
+                crate::tls::current_ipc_ctx(),
+                CAP_PROCMGR_EP,
+                &raw const msg,
+                &raw mut reply,
+            );
+            if err == TRONA_RESTART as i32 {
+                // CallSendBlocked — procmgr never received. Always retry.
+                continue;
+            }
+            if err == TRONA_INTERRUPTED as i32 {
+                // ReplyWait — procmgr received but reply was dropped.
+                // procmgr preserves the zombie when send fails.
+                if *(&raw const crate::__sig_last_restart) {
+                    continue; // SA_RESTART: retry
+                }
+                return -4; // EINTR
+            }
+            if err != 0 {
+                return super::call_err_to_posix(err);
+            }
+            if reply.label != TRONA_OK {
+                return super::trona_err_to_posix(reply.label);
+            }
 
-        if !status.is_null() {
-            *status = reply.regs[0] as i32;
+            if !status.is_null() {
+                *status = reply.regs[0] as i32;
+            }
+            return reply.regs[1] as i32;
         }
-        reply.regs[1] as i32
     }
 }
 
@@ -256,14 +267,13 @@ pub unsafe fn posix_execve(
         }
         debug_assert_eq!(pos, total_str_len);
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label == TRONA_OUT_OF_RANGE {
             return -7; // E2BIG
@@ -278,26 +288,38 @@ pub unsafe fn posix_execve(
 /// Send signal `sig` to process `pid`. Returns 0 on success, -1 on error.
 pub unsafe fn posix_kill(pid: i32, sig: i32) -> i32 {
     unsafe {
-        let mut msg = TronaMsg::zeroed();
-        let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_KILL;
-        msg.length = 2;
-        msg.regs[0] = pid as u32 as u64;
-        msg.regs[1] = sig as u64;
+        loop {
+            let mut msg = TronaMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
+            msg.label = POSIX_PM_KILL;
+            msg.length = 2;
+            msg.regs[0] = pid as u32 as u64;
+            msg.regs[1] = sig as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_PROCMGR_EP,
-            &raw const msg,
-            &raw mut reply,
-        );
-        if err != 0 {
-            return -5; // EIO
+            let err = trona::ipc::call_ctx(
+                crate::tls::current_ipc_ctx(),
+                CAP_PROCMGR_EP,
+                &raw const msg,
+                &raw mut reply,
+            );
+            if err == TRONA_RESTART as i32 {
+                // CallSendBlocked — procmgr never received. Retry.
+                continue;
+            }
+            if err == TRONA_INTERRUPTED as i32 {
+                // ReplyWait — procmgr already processed the kill.
+                // kill() is idempotent (notification bit OR) and POSIX
+                // says kill() never returns EINTR. Return success.
+                return 0;
+            }
+            if err != 0 {
+                return super::call_err_to_posix(err);
+            }
+            if reply.label != TRONA_OK {
+                return super::trona_err_to_posix(reply.label);
+            }
+            return 0;
         }
-        if reply.label != TRONA_OK {
-            return super::trona_err_to_posix(reply.label);
-        }
-        0
     }
 }
 
@@ -319,14 +341,13 @@ pub unsafe fn posix_setpgid(pid: i32, pgid: i32) -> i32 {
         msg.regs[0] = pid as u32 as u64;
         msg.regs[1] = pgid as u32 as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -344,14 +365,13 @@ pub unsafe fn posix_getpgid(pid: i32) -> i32 {
         msg.length = 1;
         msg.regs[0] = pid as u32 as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -369,14 +389,13 @@ pub unsafe fn posix_setsid() -> i32 {
         msg.label = POSIX_PM_SETSID;
         msg.length = 0;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -395,14 +414,13 @@ pub unsafe fn posix_getsid(pid: i32) -> i32 {
         msg.length = 1;
         msg.regs[0] = pid as u32 as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -419,14 +437,13 @@ pub unsafe fn posix_getuid() -> i32 {
         msg.label = POSIX_PM_GETUID;
         msg.length = 0;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -443,14 +460,13 @@ pub unsafe fn posix_geteuid() -> i32 {
         msg.label = POSIX_PM_GETEUID;
         msg.length = 0;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -467,14 +483,13 @@ pub unsafe fn posix_getgid() -> i32 {
         msg.label = POSIX_PM_GETGID;
         msg.length = 0;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -491,14 +506,13 @@ pub unsafe fn posix_getegid() -> i32 {
         msg.label = POSIX_PM_GETEGID;
         msg.length = 0;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -516,14 +530,13 @@ pub unsafe fn posix_getgroups(size: i32, _list: *mut i32) -> i32 {
         msg.length = 1;
         msg.regs[0] = size as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -553,14 +566,13 @@ pub unsafe fn posix_setitimer(
         msg.regs[3] = new_value.it_interval.tv_sec;
         msg.regs[4] = new_value.it_interval.tv_usec;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -588,14 +600,13 @@ pub unsafe fn posix_getitimer(which: i32, curr_value: *mut Itimerval) -> i32 {
         msg.length = 1;
         msg.regs[0] = which as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);

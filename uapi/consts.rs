@@ -38,6 +38,7 @@ pub const SYS_RECV_ANY: u64 = 23;
 pub const SYS_REPLY_RECV_ANY: u64 = 24;
 pub const SYS_RECV_ANY_TIMED: u64 = 25;
 pub const SYS_REPLY_RECV_ANY_TIMED: u64 = 26;
+pub const SYS_SIGRETURN: u64 = 27;
 
 pub const IPC_RECV_SOURCE_NOTIFICATION: u64 = u64::MAX;
 
@@ -79,6 +80,7 @@ pub const TCB_BIND_NOTIFICATION: u64 = 0x49;
 pub const TCB_SET_FAULT_HANDLER: u64 = 0x4B;
 pub const TCB_COPY_FPU: u64 = 0x4C;
 pub const TCB_SET_TLS_BASE: u64 = 0x4D;
+pub const TCB_SET_SIGNAL_DISPATCHER: u64 = 0x4E;
 
 /// VSpace invoke labels (0x50-0x5F): map, unmap, map_pt, walk, copy_page, map_device, clone_cow, map_device_range, protect, map_demand, map_demand_range, cow_resolve, set_cow_pool, set_cow_notif, replenish_cow_pool, protect_range.
 pub const VSPACE_MAP: u64 = 0x50;
@@ -251,7 +253,8 @@ pub const TRONA_OUT_OF_RANGE: u64 = 11;
 pub const TRONA_CANCELLED: u64 = 12;
 pub const TRONA_RESTART: u64 = 13;
 pub const TRONA_DEADLOCK: u64 = 14;
-pub const TRONA_IN_PROGRESS: u64 = 15;
+pub const TRONA_INTERRUPTED: u64 = 15;
+pub const TRONA_IN_PROGRESS: u64 = 0x10;
 pub const TRONA_PENDING: u64 = 0x80;
 
 /// VSpace page mapping flags (passed to `vspace_map`).
@@ -583,6 +586,7 @@ pub const SIG_DISP_CATCH: u64 = 2;
 
 // sigaction flags
 pub const SA_RESETHAND: i32 = 0x80000000u32 as i32;
+pub const SA_RESTART: i32 = 0x10000000;
 
 // PROT_* flags
 pub const PROT_NONE: i32 = 0x0;

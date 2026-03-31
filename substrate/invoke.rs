@@ -118,6 +118,13 @@ pub fn tcb_set_tls_base(tcb: Cap, tls_base: u64) -> i32 {
     invoke(tcb, TCB_SET_TLS_BASE, tls_base, 0, 0, 0).error as i32
 }
 
+/// Set the signal dispatcher entry point for a TCB.
+/// When non-zero, the kernel injects a signal frame on the user stack
+/// and redirects execution to this address instead of returning EINTR.
+pub fn tcb_set_signal_dispatcher(tcb: Cap, dispatcher: u64) -> i32 {
+    invoke(tcb, TCB_SET_SIGNAL_DISPATCHER, dispatcher, 0, 0, 0).error as i32
+}
+
 // ---- SchedContext operations ----
 
 /// Configure a scheduling context with budget and period (microseconds).

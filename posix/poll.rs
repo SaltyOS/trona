@@ -28,14 +28,12 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
         }
         msg.length = 2 + actual_nfds as u64 * 2;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_VFS_EP,
-            &raw const msg,
-            &raw mut reply,
-        );
+        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        if err == TRONA_INTERRUPTED as i32 {
+            return -4; // EINTR
+        }
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -121,14 +119,13 @@ pub unsafe fn posix_epoll_create() -> i32 {
         msg.label = POSIX_VFS_EPOLL_CREATE;
         msg.length = 0;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -151,14 +148,13 @@ pub unsafe fn posix_epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32, data: u6
         msg.regs[3] = events as u64;
         msg.regs[4] = data;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             CAP_VFS_EP,
             &raw const msg,
             &raw mut reply,
         );
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -186,14 +182,12 @@ pub unsafe fn posix_epoll_wait(
         msg.regs[1] = maxevents as u64;
         msg.regs[2] = timeout as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_VFS_EP,
-            &raw const msg,
-            &raw mut reply,
-        );
+        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        if err == TRONA_INTERRUPTED as i32 {
+            return -4; // EINTR
+        }
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);

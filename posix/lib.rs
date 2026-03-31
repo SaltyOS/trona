@@ -77,6 +77,7 @@ pub(crate) fn trona_err_to_posix(label: u64) -> i32 {
         TRONA_BAD_ADDRESS => -14,              // EFAULT
         TRONA_INSUFFICIENT_RIGHTS => -13,      // EACCES
         TRONA_INVALID_CAPABILITY => -9,        // EBADF
+        TRONA_INTERRUPTED => -4,               // EINTR
         TRONA_DEADLOCK => -35,                 // EDEADLK
         TRONA_INVALID_OPERATION => -1,         // EPERM
         TRONA_OUT_OF_RANGE => -34,             // ERANGE
@@ -94,6 +95,75 @@ pub(crate) fn trona_err_to_posix(label: u64) -> i32 {
         TRONA_DNS_NXDOMAIN => -2,              // ENOENT
         TRONA_DNS_SERVER_FAIL => -5,           // EIO
         _ => -5,                               // EIO (generic)
+    }
+}
+
+#[inline]
+pub(crate) fn call_err_to_posix(err: i32) -> i32 {
+    trona_err_to_posix(err as u64)
+}
+
+#[inline]
+pub(crate) fn call_err_to_posix_i64(err: i32) -> i64 {
+    call_err_to_posix(err) as i64
+}
+
+/// IPC call with retry only when the server never received the request.
+///
+/// Retries on `TRONA_RESTART` (CallSendBlocked interruption — server
+/// never saw the message, safe to re-send). Returns `TRONA_INTERRUPTED`
+/// as-is (ReplyWait interruption — server already processed the request,
+/// re-sending may cause duplicates for non-idempotent operations).
+///
+/// Use for non-idempotent operations: open, close, pipe, dup, socket,
+/// bind, mkdir, unlink, rename, etc.
+pub(crate) unsafe fn ipc_call_retry(
+    ep: u64,
+    msg: *const trona::types::TronaMsg,
+    reply: *mut trona::types::TronaMsg,
+) -> i32 {
+    unsafe {
+        loop {
+            let err = trona::ipc::call_ctx(
+                crate::tls::current_ipc_ctx(),
+                ep,
+                msg,
+                reply,
+            );
+            if err == trona::consts::TRONA_RESTART as i32 {
+                continue;
+            }
+            return err;
+        }
+    }
+}
+
+/// IPC call with retry on any signal interruption.
+///
+/// Retries on both `TRONA_RESTART` (CallSendBlocked) and
+/// `TRONA_INTERRUPTED` (ReplyWait). Safe only for idempotent read-only
+/// operations where re-sending has no side effects: stat, fstat, getpid,
+/// getuid, getcwd, access, lseek, etc.
+pub(crate) unsafe fn ipc_call_retry_idempotent(
+    ep: u64,
+    msg: *const trona::types::TronaMsg,
+    reply: *mut trona::types::TronaMsg,
+) -> i32 {
+    unsafe {
+        loop {
+            let err = trona::ipc::call_ctx(
+                crate::tls::current_ipc_ctx(),
+                ep,
+                msg,
+                reply,
+            );
+            if err == trona::consts::TRONA_RESTART as i32
+                || err == trona::consts::TRONA_INTERRUPTED as i32
+            {
+                continue;
+            }
+            return err;
+        }
     }
 }
 
@@ -143,9 +213,15 @@ pub static mut __sig_blocked_mask: u32 = 0;
 #[unsafe(no_mangle)]
 pub static mut __sig_sa_mask: [u32; NSIG] = [0; NSIG];
 
-/// Per-signal sa_flags (e.g. `SA_RESETHAND`).
+/// Per-signal sa_flags (e.g. `SA_RESETHAND`, `SA_RESTART`).
 #[unsafe(no_mangle)]
 pub static mut __sig_sa_flags: [i32; NSIG] = [0; NSIG];
+
+/// Set by `__signal_dispatcher` after delivering signals.
+/// `true` if ALL delivered signals had SA_RESTART set.
+/// POSIX wrappers check this to decide whether to retry after EINTR.
+#[unsafe(no_mangle)]
+pub static mut __sig_last_restart: bool = false;
 
 // ---------------------------------------------------------------------------
 // C ABI exports: Fork helper (called from fork.S)
@@ -209,8 +285,7 @@ pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
         msg.regs[9] = tls_base;
         msg.length = 10;
 
-        let err = trona::ipc::call_ctx(
-            tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry(
             CAP_PROCMGR_EP,
             &raw const msg,
             &raw mut reply,

@@ -21,14 +21,9 @@ pub unsafe fn posix_pipe2(fds: *mut i32, flags: i32) -> i32 {
         msg.length = 1;
         msg.regs[0] = flags as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_VFS_EP,
-            &raw const msg,
-            &raw mut reply,
-        );
+        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -48,14 +43,9 @@ pub unsafe fn posix_dup(oldfd: i32) -> i32 {
         msg.length = 1;
         msg.regs[0] = oldfd as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_VFS_EP,
-            &raw const msg,
-            &raw mut reply,
-        );
+        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -75,14 +65,9 @@ pub unsafe fn posix_dup2(oldfd: i32, newfd: i32) -> i32 {
         msg.regs[0] = oldfd as u64;
         msg.regs[1] = newfd as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_VFS_EP,
-            &raw const msg,
-            &raw mut reply,
-        );
+        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -103,14 +88,9 @@ pub unsafe fn posix_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
         msg.regs[1] = newfd as u64;
         msg.regs[2] = flags as u64;
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_VFS_EP,
-            &raw const msg,
-            &raw mut reply,
-        );
+        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);
@@ -130,14 +110,9 @@ pub unsafe fn posix_mkfifo(path: *const u8, mode: u32) -> i32 {
         let path_len = pack_path(&raw mut msg, 1, path, 128);
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
-        let err = trona::ipc::call_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_VFS_EP,
-            &raw const msg,
-            &raw mut reply,
-        );
+        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
         if err != 0 {
-            return -5; // EIO
+            return super::call_err_to_posix(err);
         }
         if reply.label != TRONA_OK {
             return super::trona_err_to_posix(reply.label);

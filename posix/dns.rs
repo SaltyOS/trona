@@ -53,8 +53,7 @@ unsafe fn resolve_dnssrv_ep() -> Result<Cap, u64> {
         let dst = &raw mut msg.regs[1] as *mut u8;
         core::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
 
-        let err = ipc::call_ctx(
-            tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             CAP_NAMESERV_EP,
             &raw const msg,
             &raw mut reply,
@@ -90,8 +89,7 @@ unsafe fn dns_resolve_multi_result_with_ep(hostname: &[u8], dnssrv_ep: u64) -> R
         core::ptr::copy_nonoverlapping(hostname.as_ptr(), dst, hostname.len());
         msg.length = 1 + ((hostname.len() as u64 + 7) / 8);
 
-        let err = ipc::call_ctx(
-            tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             dnssrv_ep,
             &raw const msg,
             &raw mut reply,
@@ -343,8 +341,7 @@ pub unsafe fn dns_reverse_lookup(ip: u32, hostname_out: *mut u8, hostname_max: u
         msg.regs[0] = ip as u64;
         msg.length = 1;
 
-        let err = ipc::call_ctx(
-            tls::current_ipc_ctx(),
+        let err = crate::ipc_call_retry_idempotent(
             ep,
             &raw const msg,
             &raw mut reply,
