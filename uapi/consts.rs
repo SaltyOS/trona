@@ -700,6 +700,9 @@ pub const NET_DNS_RESOLVE: u64 = 0xB2;
 pub const NET_DNS_RESOLVE_PTR: u64 = 0xB3;
 pub const NET_GET_CONFIG: u64 = 0xB4;
 pub const NET_GET_ARP_ENTRY: u64 = 0xB5;
+pub const NET_RECV_WAIT: u64 = 0xB6;
+pub const NET_ACCEPT_WAIT: u64 = 0xB7;
+pub const NET_RECVFROM_WAIT: u64 = 0xB8;
 
 /// Runtime network configuration states returned by `NET_GET_CONFIG`.
 pub const NETCFG_STATE_DOWN: u64 = 0;
