@@ -738,8 +738,9 @@ pub const INET_OP_CONNECT: u8 = 1;
 pub const INET_OP_RECV: u8 = 2;
 pub const INET_OP_ACCEPT: u8 = 3;
 pub const INET_OP_RECVFROM: u8 = 4;
-pub const INET_RECVMSG_WANT_ADDR: u32 = 1 << 0;
-pub const INET_RECVMSG_WANT_TIMESTAMP: u32 = 1 << 1;
+pub const INET_RECV_FLAG_WANT_ADDR: u32 = 1 << 0;
+pub const INET_RECV_FLAG_WANT_TIMESTAMP: u32 = 1 << 1;
+pub const INET_RECV_FLAG_PEEK: u32 = 1 << 2;
 pub const INET_RECV_TIMESTAMP_NONE: u64 = u64::MAX;
 
 /// Poll event flags (POLLIN, POLLOUT, POLLERR, POLLHUP, POLLNVAL).

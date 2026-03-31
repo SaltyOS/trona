@@ -7,6 +7,17 @@ use trona::consts::*;
 use trona::types::*;
 use super::{pack_path, CAP_VFS_EP};
 
+const POSIX_MSG_PEEK: i32 = 0x02;
+
+#[inline]
+fn inet_recv_wire_flags(flags: i32) -> u32 {
+    let mut wire_flags = 0u32;
+    if (flags & POSIX_MSG_PEEK) != 0 {
+        wire_flags |= INET_RECV_FLAG_PEEK;
+    }
+    wire_flags
+}
+
 #[inline]
 unsafe fn sockaddr_in_to_host(addr: *const u8) -> (u32, u16) {
     let sa = unsafe { &*(addr as *const SockAddrIn) };
@@ -569,7 +580,7 @@ pub unsafe fn posix_recvfrom(
     fd: i32,
     data: *mut u8,
     data_len: usize,
-    _flags: i32,
+    flags: i32,
     addr: *mut u8,
     addr_len: *mut u32,
 ) -> i64 {
@@ -580,8 +591,11 @@ pub unsafe fn posix_recvfrom(
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = data_len as u64;
-        // regs[2] = 1 signals "recvfrom" (wants sender address back)
-        msg.regs[2] = if !addr.is_null() { 1 } else { 0 };
+        msg.regs[2] = (if !addr.is_null() {
+            INET_RECV_FLAG_WANT_ADDR
+        } else {
+            0
+        } | inet_recv_wire_flags(flags)) as u64;
 
         let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
         if err == TRONA_INTERRUPTED as i32 {
@@ -615,6 +629,42 @@ pub unsafe fn posix_recvfrom(
     }
 }
 
+/// Receive data from an inet stream socket using the VFS recv path layout.
+///
+/// This is used for stream-oriented recv/recv(MSG_PEEK), where VFS returns
+/// data bytes starting at regs[1] without source address metadata.
+pub unsafe fn posix_recv_inet(fd: i32, data: *mut u8, data_len: usize, flags: i32) -> i64 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = POSIX_VFS_RECVMSG;
+        msg.length = 3;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = data_len as u64;
+        msg.regs[2] = inet_recv_wire_flags(flags) as u64;
+
+        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        if err == TRONA_INTERRUPTED as i32 {
+            return -4; // EINTR
+        }
+        if err != 0 {
+            return super::call_err_to_posix_i64(err);
+        }
+        if reply.label != TRONA_OK {
+            return super::trona_err_to_posix(reply.label) as i64;
+        }
+
+        let actual_data = reply.regs[0] as usize;
+        let src = &reply.regs[1] as *const u64 as *const u8;
+        let copy_len = core::cmp::min(actual_data, data_len);
+        for i in 0..copy_len {
+            *data.add(i) = *src.add(i);
+        }
+
+        actual_data as i64
+    }
+}
+
 /// Receive data, optional sender address, and optional packet timestamp from
 /// an inet socket via the VFS recvmsg path.
 pub unsafe fn posix_recvmsg_inet(
@@ -624,16 +674,17 @@ pub unsafe fn posix_recvmsg_inet(
     addr: *mut u8,
     addr_len: *mut u32,
     timestamp_ns: *mut u64,
+    extra_flags: u32,
 ) -> i64 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        let mut flags = 0u32;
+        let mut flags = extra_flags;
         if !addr.is_null() {
-            flags |= INET_RECVMSG_WANT_ADDR;
+            flags |= INET_RECV_FLAG_WANT_ADDR;
         }
         if !timestamp_ns.is_null() {
-            flags |= INET_RECVMSG_WANT_TIMESTAMP;
+            flags |= INET_RECV_FLAG_WANT_TIMESTAMP;
         }
 
         msg.label = POSIX_VFS_RECVMSG;
