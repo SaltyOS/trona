@@ -1,7 +1,17 @@
-//! Compatibility re-export of trona UAPI constants.
+//! Trona UAPI constants — grouped by namespace.
 //! SPDX-License-Identifier: GPL-2.0-only
-//!
-//! The canonical source of truth now lives in `trona/uapi/consts.rs`.
-//! Keep this module as a thin forwarding layer while userland is migrated.
 
-include!("../uapi/consts.rs");
+pub mod kernel {
+	include!("../uapi/consts/kernel.rs");
+}
+
+pub mod posix {
+	include!("../uapi/consts/posix.rs");
+}
+
+pub mod server {
+	include!("../uapi/consts/server.rs");
+}
+
+pub use kernel::*;
+pub use server::*;

@@ -7,6 +7,7 @@
 //! - **`ipc`** -- IPC operations (send, recv, call, reply_recv)
 //! - **`invoke`** -- Typed capability invocation helpers
 //! - **`consts`** -- Syscall numbers, invoke labels, error codes, well-known caps
+//! - **`protocol`** -- IPC protocol labels grouped by service/personality
 //! - **`types`** -- Shared `#[repr(C)]` types for the Rust/C boundary
 //! - **`serial`** -- Diagnostic serial output and log macros
 //! - **`slot_alloc`** -- Dynamic CNode slot allocator
@@ -32,11 +33,15 @@
 #![allow(internal_features)]
 #![feature(linkage)]
 
+use ::core::fmt::{self, Write};
+
 pub mod consts;
 pub mod framebuffer;
 pub mod invoke;
 pub mod ipc;
 pub mod layout;
+pub mod pending;
+pub mod protocol;
 pub mod serial;
 pub mod slot_alloc;
 pub mod syscall;
@@ -127,9 +132,61 @@ pub fn current_ipc_ctx() -> *mut IpcContext {
 // Panic handler (for libtrona.so and statically-linked binaries)
 // ---------------------------------------------------------------------------
 
+const CAP_PROCMGR_EP: Cap = 3;
+
+struct SerialFmtWriter<'a> {
+    line: &'a mut serial::LineBuf,
+}
+
+impl Write for SerialFmtWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.line.str(s.as_bytes());
+        Ok(())
+    }
+}
+
+fn panic_getpid() -> Option<u64> {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = protocol::PM_GETPID;
+        msg.length = 0;
+
+        let err = ipc::call_ctx(current_ipc_ctx(), CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
+        if err != 0 || reply.label != TRONA_OK {
+            return None;
+        }
+
+        Some(reply.regs[0])
+    }
+}
+
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    serial::serial_puts(b"[PANIC] userspace\n");
+fn panic(info: &::core::panic::PanicInfo) -> ! {
+    let mut line = serial::LineBuf::new();
+    line.str(b"[PANIC] userspace");
+
+    if let Some(pid) = panic_getpid() {
+        line.str(b" pid=");
+        line.dec(pid);
+    }
+
+    if let Some(location) = info.location() {
+        line.str(b" at ");
+        line.str(location.file().as_bytes());
+        line.putc(b':');
+        line.dec(location.line() as u64);
+        line.putc(b':');
+        line.dec(location.column() as u64);
+    }
+
+    {
+        let mut writer = SerialFmtWriter { line: &mut line };
+        let _ = write!(&mut writer, ": {}", info.message());
+    }
+
+    line.putc(b'\n');
+    line.flush();
     loop {
         syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     }

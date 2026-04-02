@@ -1,0 +1,17 @@
+LIBRARY kernel32.dll
+
+EXPORTS
+  CloseHandle
+  ExitProcess
+  GetConsoleMode
+  GetCurrentProcess
+  GetCurrentProcessId
+  GetLastError
+  GetStdHandle
+  ReadConsoleA
+  SetConsoleMode
+  SetLastError
+  WriteConsoleA
+  WriteConsoleW
+  __trona_ipc_ctx DATA
+  __win32srv_ep DATA

@@ -6,29 +6,32 @@
 //! 1. **Cooperative polling** (`posix_sigcheck`): userspace explicitly polls
 //!    `CAP_SIGNAL_NTFN` for pending signal bits and dispatches handlers.
 //!
-//! 2. **Kernel-injected signal frame** (`__signal_dispatcher`): when a
+//! 2. **Kernel-injected notification frame** (`__signal_dispatcher`): when a
 //!    blocking IPC Call is interrupted by a bound notification, the kernel
-//!    pushes a `SigFrame` onto the user stack and redirects execution here.
-//!    After handlers run, `SYS_SIGRETURN` restores the original context
+//!    pushes a `NotifFrame` onto the user stack and redirects execution here.
+//!    After handlers run, `SYS_NOTIF_RETURN` restores the original context
 //!    and the interrupted syscall returns EINTR.
 //!
 //! Signal disposition is tracked both locally (handler function pointers in
 //! `__sig_handlers`) and in the process manager (SIG_DFL/SIG_IGN/SIG_CATCH).
 //! Blocked signals are re-raised so they remain pending.
 
-use trona::consts::*;
-use trona::types::*;
-use core::sync::atomic::Ordering;
+use trona::consts::kernel::*;
+use trona::consts::posix::*;
+use trona::protocol::*;
+use trona::types::core::*;
+use trona::types::posix::*;
+use ::core::sync::atomic::Ordering;
 
 // Standard child CSpace layout
 const CAP_PROCMGR_EP: u64 = 3;
 const CAP_SIGNAL_NTFN: u64 = 6;
 
-/// Magic value matching the kernel's `SIGFRAME_MAGIC`.
-const SIGFRAME_MAGIC: u64 = 0x5A17_5349_4746_524D;
+/// Magic value matching the kernel's `NOTIFFRAME_MAGIC`.
+const NOTIFFRAME_MAGIC: u64 = 0x5A17_5349_4746_524D;
 
 /// Signal frame injected by the kernel onto the user stack.
-/// Layout must match the kernel's `SigFrame` exactly.
+/// Layout must match the kernel's `NotifFrame` exactly.
 #[cfg(target_arch = "x86_64")]
 #[repr(C, align(64))]
 pub struct SigFrame {
@@ -102,7 +105,7 @@ unsafe fn sig_init() {
         // Bind signal notification to our TCB (enables kernel wakeup on signal)
         trona::invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_SIGNAL_NTFN);
         // Register signal dispatcher (enables signal frame injection)
-        trona::invoke::tcb_set_signal_dispatcher(
+        trona::invoke::tcb_set_notification_dispatcher(
             CAP_SELF_TCB,
             __signal_dispatcher as *const () as usize as u64,
         );
@@ -142,7 +145,7 @@ pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
 
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_SIGACTION;
+        msg.label = PM_SIGACTION;
         msg.length = 2;
         msg.regs[0] = sig as u64;
         msg.regs[1] = disp;
@@ -169,7 +172,7 @@ pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
 ///
 /// SA_RESTART is handled at the POSIX wrapper level (e.g., `posix_read`),
 /// not here. When a blocking IPC is interrupted, the kernel delivers
-/// the signal via `__signal_dispatcher` (sigreturn trampoline) and the
+/// the signal via `__signal_dispatcher` (notif_return trampoline) and the
 /// syscall returns EINTR. POSIX wrappers check SA_RESTART and retry.
 ///
 /// Returns the number of signals dispatched (0 if none pending).
@@ -222,7 +225,7 @@ pub unsafe fn posix_sigcheck() -> i32 {
                     // Notify procmgr of disposition change
                     let mut msg = TronaMsg::zeroed();
                     let mut reply = TronaMsg::zeroed();
-                    msg.label = POSIX_PM_SIGACTION;
+                    msg.label = PM_SIGACTION;
                     msg.length = 2;
                     msg.regs[0] = sig as u64;
                     msg.regs[1] = SIG_DISP_DFL;
@@ -235,7 +238,7 @@ pub unsafe fn posix_sigcheck() -> i32 {
                 }
 
                 // Call the handler function
-                let func: unsafe extern "C" fn(i32) = core::mem::transmute(handler);
+                let func: unsafe extern "C" fn(i32) = ::core::mem::transmute(handler);
                 func(sig);
 
                 // Restore blocked mask
@@ -293,7 +296,7 @@ unsafe fn dispatch_signal_bits(bits: u64) -> i32 {
                     crate::__sig_handlers[sig as usize].store(SIG_DFL, Ordering::SeqCst);
                     let mut msg = TronaMsg::zeroed();
                     let mut reply = TronaMsg::zeroed();
-                    msg.label = POSIX_PM_SIGACTION;
+                    msg.label = PM_SIGACTION;
                     msg.length = 2;
                     msg.regs[0] = sig as u64;
                     msg.regs[1] = SIG_DISP_DFL;
@@ -309,7 +312,7 @@ unsafe fn dispatch_signal_bits(bits: u64) -> i32 {
                     any_no_restart = true;
                 }
 
-                let func: unsafe extern "C" fn(i32) = core::mem::transmute(handler);
+                let func: unsafe extern "C" fn(i32) = ::core::mem::transmute(handler);
                 func(sig);
 
                 (*(&raw mut crate::__sig_blocked_mask)) = saved_mask;
@@ -331,22 +334,22 @@ unsafe fn dispatch_signal_bits(bits: u64) -> i32 {
 /// Kernel-invoked signal dispatcher entry point.
 ///
 /// Called when the kernel interrupts a blocking IPC Call due to a bound
-/// notification. The kernel pushes a [`SigFrame`] onto the user stack and
+/// notification. The kernel pushes a notification frame onto the user stack and
 /// redirects execution here with the frame pointer as the first argument.
 ///
-/// After dispatching signal handlers, calls `SYS_SIGRETURN` to restore
+/// After dispatching signal handlers, calls `SYS_NOTIF_RETURN` to restore
 /// the original context. The interrupted syscall returns EINTR.
 /// SA_RESTART is handled at the POSIX wrapper level, not here.
 ///
 /// # Safety
-/// `frame_ptr` must point to a valid, kernel-constructed `SigFrame`.
+/// `frame_ptr` must point to a valid, kernel-constructed notification frame.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __signal_dispatcher(frame_ptr: *mut SigFrame) {
     unsafe {
         sig_init();
 
         let frame = &mut *frame_ptr;
-        if frame.magic != SIGFRAME_MAGIC {
+        if frame.magic != NOTIFFRAME_MAGIC {
             crate::proc::posix_exit(128 + 11); // SIGSEGV
         }
 
@@ -355,10 +358,10 @@ pub unsafe extern "C" fn __signal_dispatcher(frame_ptr: *mut SigFrame) {
             dispatch_signal_bits(bits);
         }
 
-        // Restore original context via sigreturn (returns EINTR to caller)
-        trona::syscall::syscall(SYS_SIGRETURN, frame_ptr as u64, 0, 0, 0, 0, 0);
+        // Restore original context via notif_return (returns EINTR to caller)
+        trona::syscall::syscall(SYS_NOTIF_RETURN, frame_ptr as u64, 0, 0, 0, 0, 0);
 
         // Should never reach here
-        core::hint::unreachable_unchecked();
+        ::core::hint::unreachable_unchecked();
     }
 }

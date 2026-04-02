@@ -6,13 +6,13 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use trona::syscall::{futex_wait, futex_wait_timeout, futex_wake};
-use core::sync::atomic::{AtomicU32, Ordering};
+use ::core::sync::atomic::{AtomicU32, Ordering};
 
 #[inline]
 fn monotonic_now_ns() -> u64 {
     trona::syscall::syscall(
-        trona::consts::SYS_CLOCK_GETTIME,
-        trona::consts::CLOCK_MONOTONIC as u64,
+        trona::consts::kernel::SYS_CLOCK_GETTIME,
+        trona::consts::kernel::CLOCK_MONOTONIC as u64,
         0,
         0,
         0,
@@ -96,7 +96,7 @@ impl Mutex {
                     return;
                 }
             }
-            core::hint::spin_loop();
+            ::core::hint::spin_loop();
         }
 
         // Futex phase: always use swap(2) to preserve the waiter flag.
@@ -131,7 +131,7 @@ impl Mutex {
             }
 
             let err = futex_wait_timeout(self.futex_ptr(), 2, remaining_ns);
-            if err == trona::consts::TRONA_CANCELLED {
+            if err == trona::consts::kernel::TRONA_CANCELLED {
                 // Timeout — last try with swap(2)
                 return self.state.swap(2, Ordering::Acquire) == 0;
             }
@@ -180,7 +180,7 @@ pub struct TypedMutex {
     mutex_type: u8,
     _pad: [u8; 3],
     /// Thread ID of the current owner (u64::MAX = no owner)
-    owner: core::sync::atomic::AtomicU64,
+    owner: ::core::sync::atomic::AtomicU64,
     /// Recursion depth (RECURSIVE only)
     count: AtomicU32,
     _pad2: [u8; 4],
@@ -192,7 +192,7 @@ impl TypedMutex {
             state: AtomicU32::new(0),
             mutex_type,
             _pad: [0; 3],
-            owner: core::sync::atomic::AtomicU64::new(u64::MAX),
+            owner: ::core::sync::atomic::AtomicU64::new(u64::MAX),
             count: AtomicU32::new(0),
             _pad2: [0; 4],
         }
@@ -361,7 +361,7 @@ impl TypedMutex {
                     return;
                 }
             }
-            core::hint::spin_loop();
+            ::core::hint::spin_loop();
         }
         // Futex phase
         loop {
@@ -389,7 +389,7 @@ impl TypedMutex {
             }
 
             let err = futex_wait_timeout(self.futex_ptr(), 2, remaining_ns);
-            if err == trona::consts::TRONA_CANCELLED {
+            if err == trona::consts::kernel::TRONA_CANCELLED {
                 return self.state.swap(2, Ordering::Acquire) == 0;
             }
         }
@@ -501,7 +501,7 @@ impl Condvar {
         mutex.lock();
         // Cancellation point: check after re-acquiring mutex
         check_cancellation();
-        if err == trona::consts::TRONA_CANCELLED { 110 } else { 0 }
+        if err == trona::consts::kernel::TRONA_CANCELLED { 110 } else { 0 }
     }
 
     /// Wait on the condition variable with a typed mutex (RECURSIVE/ERRORCHECK).
@@ -537,7 +537,7 @@ impl Condvar {
         clear_blocked_futex();
         mutex.condvar_relock(saved);
         check_cancellation();
-        if err == trona::consts::TRONA_CANCELLED { 110 } else { 0 }
+        if err == trona::consts::kernel::TRONA_CANCELLED { 110 } else { 0 }
     }
 
     /// Wake one waiting thread.
@@ -702,7 +702,7 @@ impl RWLock {
             }
             let wake_val = self.writer_wake.load(Ordering::Relaxed);
             let err = futex_wait_timeout(self.writer_futex_ptr(), wake_val, remaining);
-            if err == trona::consts::TRONA_CANCELLED {
+            if err == trona::consts::kernel::TRONA_CANCELLED {
                 // Timeout — one last try
                 let s2 = self.state.load(Ordering::Relaxed);
                 if s2 & WRITER_BIT == 0 {
@@ -744,7 +744,7 @@ impl RWLock {
                 }
                 let wake_val = self.writer_wake.load(Ordering::Relaxed);
                 let err = futex_wait_timeout(self.writer_futex_ptr(), wake_val, remaining);
-                if err == trona::consts::TRONA_CANCELLED {
+                if err == trona::consts::kernel::TRONA_CANCELLED {
                     // Timeout — one last try
                     if self.state.compare_exchange(
                         0, WRITER_BIT, Ordering::Acquire, Ordering::Relaxed,
@@ -922,7 +922,7 @@ impl Semaphore {
                 return 110; // ETIMEDOUT
             }
             let err = futex_wait_timeout(self.futex_ptr(), 0, remaining);
-            if err == trona::consts::TRONA_CANCELLED {
+            if err == trona::consts::kernel::TRONA_CANCELLED {
                 // Last-chance try
                 let c2 = self.count.load(Ordering::Relaxed);
                 if c2 > 0 {
@@ -1034,7 +1034,7 @@ impl Once {
 fn check_cancellation() {
     if let Some(tls) = crate::tls::current_tls() {
         unsafe {
-            let pending = core::ptr::read_volatile(&raw const (*tls).cancel_pending);
+            let pending = ::core::ptr::read_volatile(&raw const (*tls).cancel_pending);
             if pending != 0 && (*tls).cancel_state == 0 {
                 crate::pthread::pthread_testcancel();
             }

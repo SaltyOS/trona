@@ -13,6 +13,7 @@
 use crate::consts::*;
 use crate::invoke;
 use crate::ipc;
+use crate::protocol::PM_EXPAND_CSPACE;
 use crate::syscall::syscall;
 use crate::types::Cap;
 
@@ -558,7 +559,7 @@ fn request_expand_blocking(ep: Cap) -> Option<(Cap, u64)> {
     unsafe {
         let mut msg = crate::types::TronaMsg::zeroed();
         let mut reply = crate::types::TronaMsg::zeroed();
-        msg.label = POSIX_PM_EXPAND_CSPACE;
+        msg.label = PM_EXPAND_CSPACE;
         msg.length = 1;
         msg.regs[0] = SLOT_EXPAND_BITS_DEFAULT;
 

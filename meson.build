@@ -136,6 +136,51 @@ trona_loader_obj = trona_loader[0]
 trona_loader_rmeta = libtrona_build_dir / 'libtrona_loader.rmeta'
 
 # =============================================================================
+# kernel32.dll — Win32 API compatibility layer for PE programs (real PE/COFF)
+# =============================================================================
+
+if arch == 'x86_64'
+  kernel32_pe_target = 'x86_64-w64-windows-gnu'
+  kernel32_pe_machine = 'amd64'
+elif arch == 'aarch64'
+  kernel32_pe_target = 'aarch64-w64-windows-gnu'
+  kernel32_pe_machine = 'arm64'
+else
+  error('Unsupported arch for kernel32.dll PE build: ' + arch)
+endif
+
+kernel32_pe_args = [
+  '--target=' + kernel32_pe_target,
+  '-ffreestanding',
+  '-fno-stack-protector',
+  '-fno-builtin',
+  '-fvisibility=hidden',
+]
+
+kernel32_pe_obj = custom_target('kernel32_pe_obj',
+  input: files('win32/kernel32_pe.c'),
+  output: 'kernel32_pe.obj',
+  depfile: 'kernel32_pe.d',
+  command: cc_cmd + kernel32_pe_args + ['-MMD', '-MF', '@DEPFILE@', '-c', '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default: true,
+)
+
+kernel32_dll = custom_target('kernel32_dll',
+  input: [kernel32_pe_obj, files('win32/kernel32_pe.def')],
+  output: 'kernel32.dll',
+  command: [lld_link,
+    '-dll',
+    '-noentry',
+    '-nodefaultlib',
+    '-machine:' + kernel32_pe_machine,
+    '-def:@INPUT1@',
+    '-out:@OUTPUT@',
+    '@INPUT0@',
+  ],
+  build_by_default: true,
+)
+
+# =============================================================================
 # fork.S — arch-specific fork assembly
 # =============================================================================
 
@@ -191,7 +236,7 @@ subdir('uapi')
 # Custom targets (for depends/input):
 #   libtrona_so         — libtrona.so shared library
 #   libtrona_rust       — trona substrate target (use for depends in userland)
-#   ld_trona_so         — ld-trona.so dynamic linker (from rtld/)
+#   ld_trona_so         — ld-trona.so dynamic linker (from rtld/elf/)
 #   fork_obj            — fork assembly object (for init static link)
 #
 # Individual .o files (for init static link):

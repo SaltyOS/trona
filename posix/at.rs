@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! POSIX *at() operations (openat, fstatat, unlinkat, renameat, symlinkat).
 
-use trona::consts::*;
-use trona::types::*;
+use trona::consts::kernel::*;
+use trona::protocol::*;
+use trona::types::core::*;
+use trona::types::posix::*;
 use super::{pack_path, CAP_VFS_EP};
 
 /// openat(dirfd, path, flags, mode)
@@ -12,7 +14,7 @@ pub unsafe fn posix_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -
         let mode = mode & !super::misc::get_umask();
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_OPENAT;
+        msg.label = VFS_OPENAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = flags as u32 as u64;
         msg.regs[2] = mode as u64;
@@ -36,7 +38,7 @@ pub unsafe fn posix_fstatat(dirfd: i32, path: *const u8, st: *mut TronaStat, at_
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_FSTATAT;
+        msg.label = VFS_FSTATAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = at_flags as u32 as u64;
         let path_len = pack_path(&raw mut msg, 2, path, 128);
@@ -70,7 +72,7 @@ pub unsafe fn posix_unlinkat(dirfd: i32, path: *const u8, at_flags: i32) -> i32 
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_UNLINKAT;
+        msg.label = VFS_UNLINKAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = at_flags as u32 as u64;
         let path_len = pack_path(&raw mut msg, 2, path, 128);
@@ -98,7 +100,7 @@ pub unsafe fn posix_renameat(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_RENAMEAT;
+        msg.label = VFS_RENAMEAT;
 
         let mut old_len: u8 = 0;
         while *old_path.add(old_len as usize) != 0 && old_len < 64 {
@@ -150,7 +152,7 @@ pub unsafe fn posix_mkdirat(dirfd: i32, path: *const u8, mode: i32) -> i32 {
         let mode = (mode as u32) & !super::misc::get_umask();
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_MKDIRAT;
+        msg.label = VFS_MKDIRAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = mode as u64;
         let path_len = pack_path(&raw mut msg, 2, path, 128);
@@ -173,7 +175,7 @@ pub unsafe fn posix_faccessat(dirfd: i32, path: *const u8, mode: i32, at_flags: 
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_FACCESSAT;
+        msg.label = VFS_FACCESSAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = mode as u64;
         msg.regs[2] = at_flags as u32 as u64;
@@ -197,7 +199,7 @@ pub unsafe fn posix_fchmodat(dirfd: i32, path: *const u8, mode: u32, at_flags: i
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_FCHMODAT;
+        msg.label = VFS_FCHMODAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = mode as u64;
         msg.regs[2] = at_flags as u32 as u64;
@@ -227,7 +229,7 @@ pub unsafe fn posix_fchownat(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_FCHOWNAT;
+        msg.label = VFS_FCHOWNAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = uid as u64;
         msg.regs[2] = gid as u64;
@@ -260,7 +262,7 @@ pub unsafe fn posix_utimensat(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_UTIMENSAT;
+        msg.label = VFS_UTIMENSAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = at_flags as u32 as u64;
         msg.regs[2] = atime_sec as u64;
@@ -288,7 +290,7 @@ pub unsafe fn posix_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_SYMLINKAT;
+        msg.label = VFS_SYMLINKAT;
 
         // newdirfd in regs[0]
         msg.regs[0] = newdirfd as u32 as u64;
@@ -340,7 +342,7 @@ pub unsafe fn posix_readlinkat(dirfd: i32, path: *const u8, buf: *mut u8, bufsiz
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_READLINKAT;
+        msg.label = VFS_READLINKAT;
         msg.regs[0] = dirfd as u32 as u64;
         let path_len = pack_path(&raw mut msg, 1, path, 128);
         msg.length = 2 + ((path_len as u64 + 7) / 8);
@@ -376,7 +378,7 @@ pub unsafe fn posix_linkat(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_LINKAT;
+        msg.label = VFS_LINKAT;
 
         // Measure old path length
         let mut old_len: u8 = 0;

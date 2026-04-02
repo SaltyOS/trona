@@ -1,71 +1,21 @@
 //! POSIX memory management — thin IPC client to mmsrv
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
-//! All anonymous page allocation (brk/sbrk/mmap/munmap/mprotect) is delegated
-//! to the centralized memory server (mmsrv) via IPC.  fd-backed mmap (e.g.
-//! /dev/fb0) still delegates to VFS for device cap transfer, then maps the
-//! device pages locally.
+//! All page allocation (brk/sbrk/mmap/munmap/mprotect) is delegated to the
+//! centralized memory server (mmsrv) via IPC.  fd-backed mmap (file, mount,
+//! device) uses MM_FILE_MMAP; mmsrv resolves the fd backing via
+//! VFS_RESOLVE_BACKING and maps pages directly into the client's VSpace.
 
-use trona::consts::*;
-use trona::invoke;
-use trona::ipc;
-use trona::types::*;
-
-// Standard child CSpace layout
-const CAP_SELF_VSPACE: u64 = 1;
-const CAP_SELF_CSPACE: u64 = 2;
-const CAP_VFS_EP: u64 = 4;
+use trona::consts::kernel::*;
+use trona::consts::posix::*;
+use trona::protocol::*;
+use trona::types::core::*;
 
 /// mmsrv endpoint cap. Set by `posix_mm_init`.
 static mut MMSRV_EP: Cap = 0;
 
 /// Whether the memory manager has been initialized.
 static mut MM_INITIALIZED: bool = false;
-
-/// Bump allocator for fd-backed (device) mappings. Separate address range
-/// from the mmsrv-managed heap/mmap space so they never collide.
-const DEVICE_MMAP_BASE: u64 = 0x0000_0000_8000_0000; // 2 GB
-const DEVICE_MMAP_LIMIT: u64 = 0x0000_0001_0000_0000; // 4 GB (2 GB range)
-static mut DEVICE_MMAP_NEXT: u64 = DEVICE_MMAP_BASE;
-
-/// Minimal tracking for device-mapped regions (needed for munmap cleanup).
-const MAX_DEVICE_REGIONS: usize = 4;
-
-/// Spinlock protecting DEVICE_MMAP_NEXT and DEVICE_REGIONS for thread safety.
-static DEVICE_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-#[inline]
-fn device_lock_acquire() {
-    use core::sync::atomic::Ordering;
-    while DEVICE_LOCK.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        while DEVICE_LOCK.load(Ordering::Relaxed) != 0 {
-            core::hint::spin_loop();
-        }
-    }
-}
-
-#[inline]
-fn device_lock_release() {
-    DEVICE_LOCK.store(0, core::sync::atomic::Ordering::Release);
-}
-
-struct DeviceRegion {
-    base: u64,
-    length: u64,
-    device_cap: Cap,
-    active: bool,
-}
-
-impl DeviceRegion {
-    const fn empty() -> Self {
-        DeviceRegion { base: 0, length: 0, device_cap: 0, active: false }
-    }
-}
-
-static mut DEVICE_REGIONS: [DeviceRegion; MAX_DEVICE_REGIONS] = {
-    const E: DeviceRegion = DeviceRegion::empty();
-    [E; MAX_DEVICE_REGIONS]
-};
 
 // ---------------------------------------------------------------------------
 // Init
@@ -142,148 +92,12 @@ pub unsafe fn posix_sbrk(increment: i64) -> u64 {
 // mmap / munmap / mprotect
 // ---------------------------------------------------------------------------
 
-/// fd-backed mmap: sends POSIX_VFS_MMAP to VFS, receives device untyped cap,
-/// then maps it locally with write-combining flags.
-unsafe fn posix_mmap_fd(
-    addr: *mut u8,
-    length: u64,
-    _prot: i32,
-    _flags: i32,
-    fd: i32,
-    offset: i64,
-) -> *mut u8 {
-    unsafe {
-        if offset < 0 {
-            return usize::MAX as *mut u8;
-        }
-
-        let len = match length.checked_add(4095) {
-            Some(v) => v & !4095u64,
-            None => return usize::MAX as *mut u8,
-        };
-        let num_pages = len / 4096;
-        if num_pages > u16::MAX as u64 {
-            return usize::MAX as *mut u8;
-        }
-
-        // Allocate a free cap slot to receive the transferred capability
-        let recv_slot = match trona::slot_alloc::slot_alloc() {
-            Some(s) => s,
-            None => return usize::MAX as *mut u8,
-        };
-
-        // Prepare receive slot for IPC cap transfer
-        ipc::set_receive_slot_ctx(
-            crate::tls::current_ipc_ctx(),
-            CAP_SELF_CSPACE,
-            recv_slot,
-            0,
-        );
-
-        // Send POSIX_VFS_MMAP to VFS
-        let mut msg = TronaMsg::zeroed();
-        let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_MMAP;
-        msg.length = 6;
-        msg.regs[0] = fd as u64;
-        msg.regs[1] = offset as u64;
-        msg.regs[2] = len;
-        msg.regs[3] = _prot as u64;
-        msg.regs[4] = _flags as u64;
-        msg.regs[5] = addr as u64;
-
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
-        if err != 0 || reply.label != TRONA_OK {
-            invoke::cnode_delete(CAP_SELF_CSPACE, recv_slot);
-            return usize::MAX as *mut u8;
-        }
-
-        // Server-side mapped (e.g. SHM via mmsrv): frames already in our VSpace
-        if reply.regs[2] == 1 {
-            // No cap was transferred — clean up the unused recv slot
-            invoke::cnode_delete(CAP_SELF_CSPACE, recv_slot);
-            return reply.regs[0] as *mut u8;
-        }
-
-        // Pick a mapping base from the device-mmap bump allocator (locked)
-        device_lock_acquire();
-        let base = *(&raw const DEVICE_MMAP_NEXT);
-        let new_next = match base.checked_add(len) {
-            Some(n) if n <= DEVICE_MMAP_LIMIT => n,
-            _ => {
-                device_lock_release();
-                invoke::cnode_delete(CAP_SELF_CSPACE, recv_slot);
-                return usize::MAX as *mut u8;
-            }
-        };
-        *(&raw mut DEVICE_MMAP_NEXT) = new_next;
-        device_lock_release();
-
-        // Map using batch device range syscall with WC flags
-        let map_flags = VSPACE_FLAG_WRITABLE | VSPACE_FLAG_USER | VSPACE_FLAG_WRITE_THROUGH;
-        let (map_err, mapped) = invoke::vspace_map_device_range(
-            CAP_SELF_VSPACE,
-            recv_slot,
-            offset as u64,
-            base,
-            num_pages,
-            map_flags,
-        );
-        if map_err != 0 || mapped != num_pages {
-            for i in 0..mapped {
-                invoke::vspace_unmap(CAP_SELF_VSPACE, base + i * 4096);
-            }
-            invoke::cnode_delete(CAP_SELF_CSPACE, recv_slot);
-            // Conditional rollback: only if no one else has bumped past us
-            device_lock_acquire();
-            if *(&raw const DEVICE_MMAP_NEXT) == new_next {
-                *(&raw mut DEVICE_MMAP_NEXT) = base;
-            }
-            device_lock_release();
-            return usize::MAX as *mut u8;
-        }
-
-        // Track for munmap cleanup (locked)
-        device_lock_acquire();
-        let regions = &raw mut DEVICE_REGIONS;
-        let mut tracked = false;
-        for i in 0..MAX_DEVICE_REGIONS {
-            if !(*regions)[i].active {
-                (*regions)[i] = DeviceRegion {
-                    base,
-                    length: len,
-                    device_cap: recv_slot,
-                    active: true,
-                };
-                tracked = true;
-                break;
-            }
-        }
-        device_lock_release();
-
-        if !tracked {
-            // No tracking slot available — unmap everything and fail
-            for i in 0..num_pages {
-                invoke::vspace_unmap(CAP_SELF_VSPACE, base + i * 4096);
-            }
-            invoke::cnode_delete(CAP_SELF_CSPACE, recv_slot);
-            // Conditional rollback
-            device_lock_acquire();
-            if *(&raw const DEVICE_MMAP_NEXT) == new_next {
-                *(&raw mut DEVICE_MMAP_NEXT) = base;
-            }
-            device_lock_release();
-            return usize::MAX as *mut u8;
-        }
-
-        base as *mut u8
-    }
-}
-
 /// Map pages into the process address space.
 ///
 /// - **Anonymous** (`MAP_ANONYMOUS`): delegates to mmsrv via `MM_MMAP`.
-/// - **fd-backed** (`fd >= 0`): delegates to VFS for device cap transfer.
+/// - **fd-backed** (`fd >= 0`): delegates to mmsrv via `MM_FILE_MMAP`.
+///   mmsrv resolves the fd backing via VFS_RESOLVE_BACKING and maps
+///   pages directly into the client's VSpace (file, mount, device).
 ///
 /// Returns the mapped base address, or `MAP_FAILED` (usize::MAX) on error.
 pub unsafe fn posix_mmap(
@@ -299,9 +113,30 @@ pub unsafe fn posix_mmap(
             return usize::MAX as *mut u8;
         }
 
-        // fd-backed mmap (e.g. /dev/fb0): delegate to VFS for cap transfer
+        // fd-backed mmap: delegate to mmsrv
         if fd >= 0 && (flags & MAP_ANONYMOUS) == 0 {
-            return posix_mmap_fd(addr, length, prot, flags, fd, offset);
+            if offset < 0 {
+                return usize::MAX as *mut u8;
+            }
+            let mut msg = TronaMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
+            msg.label = MM_FILE_MMAP;
+            msg.length = 6;
+            msg.regs[0] = fd as u64;
+            msg.regs[1] = offset as u64;
+            msg.regs[2] = length;
+            msg.regs[3] = prot as u64;
+            msg.regs[4] = flags as u64;
+            msg.regs[5] = addr as u64;
+            let err = crate::ipc_call_retry(
+                *(&raw const MMSRV_EP),
+                &raw const msg,
+                &raw mut reply,
+            );
+            if err != 0 || reply.label != TRONA_OK {
+                return usize::MAX as *mut u8;
+            }
+            return reply.regs[0] as *mut u8;
         }
 
         if (flags & MAP_ANONYMOUS) == 0 {
@@ -331,43 +166,18 @@ pub unsafe fn posix_mmap(
 }
 
 /// Unmap a previously mmap'd region.
-///
-/// Device-backed regions are handled locally; anonymous regions are
-/// forwarded to mmsrv via `MM_MUNMAP`.
+/// All regions (anonymous, file-backed, device) are managed by mmsrv.
 pub unsafe fn posix_munmap(addr: *mut u8, length: u64) -> i32 {
     unsafe {
         if !*(&raw const MM_INITIALIZED) {
             return -1;
         }
 
-        let base = addr as u64;
-
-        // Check if this is a device-backed region (local tracking)
-        device_lock_acquire();
-        let regions = &raw mut DEVICE_REGIONS;
-        for i in 0..MAX_DEVICE_REGIONS {
-            if (*regions)[i].active && (*regions)[i].base == base {
-                let r = &mut (*regions)[i];
-                let pages = r.length / 4096;
-                for j in 0..pages {
-                    invoke::vspace_unmap(CAP_SELF_VSPACE, r.base + j * 4096);
-                }
-                if r.device_cap != 0 {
-                    invoke::cnode_delete(CAP_SELF_CSPACE, r.device_cap);
-                }
-                r.active = false;
-                device_lock_release();
-                return 0;
-            }
-        }
-        device_lock_release();
-
-        // Anonymous region → mmsrv IPC
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
         msg.label = MM_MUNMAP;
         msg.length = 2;
-        msg.regs[0] = base;
+        msg.regs[0] = addr as u64;
         msg.regs[1] = length;
         let err = crate::ipc_call_retry(
             *(&raw const MMSRV_EP),

@@ -15,10 +15,10 @@
 //! `alloc_frame_slot` callback, or fall back to internal scanning of
 //! untyped capabilities.
 
-use trona::consts::*;
+use trona::consts::kernel::*;
 use trona::invoke;
 use trona::serial;
-use trona::types::*;
+use trona::types::core::*;
 
 // Standard child CSpace layout
 const CAP_SELF_CSPACE: u64 = 2;

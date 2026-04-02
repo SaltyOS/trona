@@ -2,8 +2,10 @@
 //! POSIX file operations (open, read, write, close, stat, lseek, access, unlink).
 
 use super::{pack_path, CAP_VFS_EP};
-use trona::consts::*;
-use trona::types::*;
+use trona::consts::kernel::*;
+use trona::protocol::*;
+use trona::types::core::*;
+use trona::types::posix::*;
 
 /// Open a file at `path` with the given `flags` (O_RDONLY, O_CREAT, etc.).
 /// `mode` specifies permission bits when creating a file (masked with 0o777).
@@ -14,7 +16,7 @@ pub unsafe fn posix_open(path: *const u8, flags: i32, mode: u32) -> i32 {
         let mode = mode & !super::misc::get_umask();
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_OPEN;
+        msg.label = VFS_OPEN;
         msg.regs[0] = mode as u64;
         msg.regs[1] = flags as u32 as u64;
         let path_len = pack_path(&raw mut msg, 2, path, 128);
@@ -62,7 +64,7 @@ pub unsafe fn posix_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
 
             let mut msg = TronaMsg::zeroed();
             let mut reply = TronaMsg::zeroed();
-            msg.label = POSIX_VFS_READ;
+            msg.label = VFS_READ;
             msg.length = 2;
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk;
@@ -126,7 +128,7 @@ pub unsafe fn posix_write(fd: i32, buf: *const u8, count: u64) -> i64 {
 
             let mut msg = TronaMsg::zeroed();
             let mut reply = TronaMsg::zeroed();
-            msg.label = POSIX_VFS_WRITE;
+            msg.label = VFS_WRITE;
             msg.length = 2 + ((chunk + 7) / 8);
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk;
@@ -188,7 +190,7 @@ pub unsafe fn posix_pread(fd: i32, buf: *mut u8, count: u64, offset: i64) -> i64
 
             let mut msg = TronaMsg::zeroed();
             let mut reply = TronaMsg::zeroed();
-            msg.label = POSIX_VFS_PREAD;
+            msg.label = VFS_PREAD;
             msg.length = 3;
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk;
@@ -263,7 +265,7 @@ pub unsafe fn posix_pwrite(fd: i32, buf: *const u8, count: u64, offset: i64) -> 
 
             let mut msg = TronaMsg::zeroed();
             let mut reply = TronaMsg::zeroed();
-            msg.label = POSIX_VFS_PWRITE;
+            msg.label = VFS_PWRITE;
             msg.length = 3 + ((chunk + 7) / 8);
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk;
@@ -310,7 +312,7 @@ pub unsafe fn posix_close(fd: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_CLOSE;
+        msg.label = VFS_CLOSE;
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
@@ -335,7 +337,7 @@ pub unsafe fn posix_stat(path: *const u8, st: *mut TronaStat) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_STAT;
+        msg.label = VFS_STAT;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
@@ -370,7 +372,7 @@ pub unsafe fn posix_lstat(path: *const u8, st: *mut TronaStat) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_LSTAT;
+        msg.label = VFS_LSTAT;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
@@ -405,7 +407,7 @@ pub unsafe fn posix_fstat(fd: i32, st: *mut TronaStat) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_FSTAT;
+        msg.label = VFS_FSTAT;
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
@@ -441,7 +443,7 @@ pub unsafe fn posix_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_LSEEK;
+        msg.label = VFS_LSEEK;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = offset as u64;
@@ -468,7 +470,7 @@ pub unsafe fn posix_access(path: *const u8, mode: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_ACCESS;
+        msg.label = VFS_ACCESS;
         let path_len = pack_path(&raw mut msg, 1, path, 128);
         msg.regs[0] = mode as u64;
         msg.length = 2 + ((path_len as u64 + 7) / 8);
@@ -493,7 +495,7 @@ pub unsafe fn posix_unlink(path: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_UNLINK;
+        msg.label = VFS_UNLINK;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
@@ -520,7 +522,7 @@ pub unsafe fn posix_rename(old_path: *const u8, new_path: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_RENAME;
+        msg.label = VFS_RENAME;
 
         let mut old_len: u8 = 0;
         while *old_path.add(old_len as usize) != 0 && old_len < 64 {
@@ -568,7 +570,7 @@ pub unsafe fn posix_mkdir(path: *const u8, mode: i32) -> i32 {
         let mode = (mode as u32) & !super::misc::get_umask();
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_MKDIR;
+        msg.label = VFS_MKDIR;
         let path_len = pack_path(&raw mut msg, 1, path, 128);
         msg.regs[0] = mode as u64;
         msg.length = 2 + ((path_len as u64 + 7) / 8);
@@ -593,7 +595,7 @@ pub unsafe fn posix_rmdir(path: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_RMDIR;
+        msg.label = VFS_RMDIR;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
@@ -617,7 +619,7 @@ pub unsafe fn posix_opendir(path: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_OPENDIR;
+        msg.label = VFS_OPENDIR;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
@@ -644,7 +646,7 @@ pub unsafe fn posix_readdir(dir_fd: i32, entry: *mut TronaDirent) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_READDIR;
+        msg.label = VFS_READDIR;
         msg.length = 1;
         msg.regs[0] = dir_fd as u64;
 
@@ -687,7 +689,7 @@ pub unsafe fn posix_ftruncate(fd: i32, length: u64) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_FTRUNCATE;
+        msg.label = VFS_FTRUNCATE;
         msg.length = 2;
         msg.regs[0] = fd as u64;
         msg.regs[1] = length;

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! POSIX pipe, pipe2, dup/dup2/dup3, mkfifo operations.
 
-use trona::consts::*;
-use trona::types::*;
+use trona::consts::kernel::*;
+use trona::protocol::*;
+use trona::types::core::*;
 use super::{pack_path, CAP_VFS_EP};
 
 /// Create a pipe. Convenience wrapper for `posix_pipe2(fds, 0)`.
@@ -17,7 +18,7 @@ pub unsafe fn posix_pipe2(fds: *mut i32, flags: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_PIPE;
+        msg.label = VFS_PIPE;
         msg.length = 1;
         msg.regs[0] = flags as u64;
 
@@ -39,7 +40,7 @@ pub unsafe fn posix_dup(oldfd: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_DUP;
+        msg.label = VFS_DUP;
         msg.length = 1;
         msg.regs[0] = oldfd as u64;
 
@@ -60,7 +61,7 @@ pub unsafe fn posix_dup2(oldfd: i32, newfd: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_DUP2;
+        msg.label = VFS_DUP2;
         msg.length = 2;
         msg.regs[0] = oldfd as u64;
         msg.regs[1] = newfd as u64;
@@ -82,7 +83,7 @@ pub unsafe fn posix_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_DUP3;
+        msg.label = VFS_DUP3;
         msg.length = 3;
         msg.regs[0] = oldfd as u64;
         msg.regs[1] = newfd as u64;
@@ -105,7 +106,7 @@ pub unsafe fn posix_mkfifo(path: *const u8, mode: u32) -> i32 {
         let mode = mode & !super::misc::get_umask();
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_MKFIFO;
+        msg.label = VFS_MKFIFO;
         msg.regs[0] = mode as u64;
         let path_len = pack_path(&raw mut msg, 1, path, 128);
         msg.length = 2 + ((path_len as u64 + 7) / 8);

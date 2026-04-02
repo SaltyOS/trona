@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! POSIX process operations (exit, getpid, waitpid, execve, kill, clock_gettime).
 
-use trona::consts::*;
-use trona::types::*;
+use trona::consts::kernel::*;
+use trona::protocol::*;
+use trona::types::core::*;
 use super::CAP_PROCMGR_EP;
 
 const EXEC_MSG_MIN_SLOWPATH_LEN: usize = 5;
@@ -35,7 +36,7 @@ pub unsafe fn posix_exit(status: i32) -> ! {
         crate::pthread::process_exit_reap();
 
         let mut msg = TronaMsg::zeroed();
-        msg.label = POSIX_PM_EXIT;
+        msg.label = PM_EXIT;
         msg.length = 1;
         msg.regs[0] = status as u64;
 
@@ -60,7 +61,7 @@ pub unsafe fn posix_getpid() -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_GETPID;
+        msg.label = PM_GETPID;
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
@@ -83,7 +84,7 @@ pub unsafe fn posix_getppid() -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_GETPPID;
+        msg.label = PM_GETPPID;
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
@@ -111,7 +112,7 @@ pub unsafe fn posix_waitpid3(pid: i32, status: *mut i32, options: i32) -> i32 {
         loop {
             let mut msg = TronaMsg::zeroed();
             let mut reply = TronaMsg::zeroed();
-            msg.label = POSIX_PM_WAIT;
+            msg.label = PM_WAIT;
             msg.length = 2;
             msg.regs[0] = pid as u32 as u64;
             msg.regs[1] = options as u64;
@@ -169,7 +170,7 @@ pub unsafe fn posix_execve(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_EXEC;
+        msg.label = PM_EXEC;
 
         let mut path_len: u8 = 0;
         while *path.add(path_len as usize) != 0 && path_len < 64 {
@@ -229,7 +230,7 @@ pub unsafe fn posix_execve(
 
         // regs[path_regs + 1] = total argv/envp payload bytes in ipc_buffer.reserved[]
         msg.regs[next + 1] = total_str_len as u64;
-        msg.length = core::cmp::max(next + 2, EXEC_MSG_MIN_SLOWPATH_LEN) as u64;
+        msg.length = ::core::cmp::max(next + 2, EXEC_MSG_MIN_SLOWPATH_LEN) as u64;
 
         let ipc_buf = &mut *(*ctx).ipc_buffer;
         let str_dst = ipc_buf.reserved.as_mut_ptr() as *mut u8;
@@ -291,7 +292,7 @@ pub unsafe fn posix_kill(pid: i32, sig: i32) -> i32 {
         loop {
             let mut msg = TronaMsg::zeroed();
             let mut reply = TronaMsg::zeroed();
-            msg.label = POSIX_PM_KILL;
+            msg.label = PM_KILL;
             msg.length = 2;
             msg.regs[0] = pid as u32 as u64;
             msg.regs[1] = sig as u64;
@@ -336,7 +337,7 @@ pub unsafe fn posix_setpgid(pid: i32, pgid: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_SETPGID;
+        msg.label = PM_SETPGID;
         msg.length = 2;
         msg.regs[0] = pid as u32 as u64;
         msg.regs[1] = pgid as u32 as u64;
@@ -361,7 +362,7 @@ pub unsafe fn posix_getpgid(pid: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_GETPGID;
+        msg.label = PM_GETPGID;
         msg.length = 1;
         msg.regs[0] = pid as u32 as u64;
 
@@ -386,7 +387,7 @@ pub unsafe fn posix_setsid() -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_SETSID;
+        msg.label = PM_SETSID;
         msg.length = 0;
 
         let err = crate::ipc_call_retry(
@@ -410,7 +411,7 @@ pub unsafe fn posix_getsid(pid: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_GETSID;
+        msg.label = PM_GETSID;
         msg.length = 1;
         msg.regs[0] = pid as u32 as u64;
 
@@ -434,7 +435,7 @@ pub unsafe fn posix_getuid() -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_GETUID;
+        msg.label = PM_GETUID;
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
@@ -457,7 +458,7 @@ pub unsafe fn posix_geteuid() -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_GETEUID;
+        msg.label = PM_GETEUID;
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
@@ -480,7 +481,7 @@ pub unsafe fn posix_getgid() -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_GETGID;
+        msg.label = PM_GETGID;
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
@@ -503,7 +504,7 @@ pub unsafe fn posix_getegid() -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_GETEGID;
+        msg.label = PM_GETEGID;
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
@@ -526,7 +527,7 @@ pub unsafe fn posix_getgroups(size: i32, _list: *mut i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_GETGROUPS;
+        msg.label = PM_GETGROUPS;
         msg.length = 1;
         msg.regs[0] = size as u64;
 
@@ -558,7 +559,7 @@ pub unsafe fn posix_setitimer(
         let new_value = &*new_value;
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_SETITIMER;
+        msg.label = PM_SETITIMER;
         msg.length = 5;
         msg.regs[0] = which as u64;
         msg.regs[1] = new_value.it_value.tv_sec;
@@ -596,7 +597,7 @@ pub unsafe fn posix_getitimer(which: i32, curr_value: *mut Itimerval) -> i32 {
 
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_GETITIMER;
+        msg.label = PM_GETITIMER;
         msg.length = 1;
         msg.regs[0] = which as u64;
 
@@ -623,7 +624,7 @@ pub unsafe fn posix_getitimer(which: i32, curr_value: *mut Itimerval) -> i32 {
 /// Read the monotonic clock, writing seconds and nanoseconds into `*ts`.
 /// Uses the kernel `SYS_CLOCK_GETTIME` syscall directly (no IPC).
 /// Returns 0 on success, -1 on error.
-pub unsafe fn posix_clock_gettime(clock_id: i32, ts: *mut trona::types::Timespec) -> i32 {
+pub unsafe fn posix_clock_gettime(clock_id: i32, ts: *mut trona::types::core::Timespec) -> i32 {
     unsafe {
         let res = trona::syscall::syscall(SYS_CLOCK_GETTIME, clock_id as u64, 0, 0, 0, 0, 0);
         if res.error != 0 {
@@ -639,7 +640,7 @@ pub unsafe fn posix_clock_gettime(clock_id: i32, ts: *mut trona::types::Timespec
 /// Get the current time as seconds + microseconds into `*tv`.
 /// Uses the kernel clock syscall, converting nanoseconds to microseconds.
 /// Returns 0 on success, -1 on error.
-pub unsafe fn posix_gettimeofday(tv: *mut trona::types::Timeval) -> i32 {
+pub unsafe fn posix_gettimeofday(tv: *mut trona::types::core::Timeval) -> i32 {
     unsafe {
         let res = trona::syscall::syscall(SYS_CLOCK_GETTIME, 0, 0, 0, 0, 0, 0);
         if res.error != 0 {
@@ -655,7 +656,7 @@ pub unsafe fn posix_gettimeofday(tv: *mut trona::types::Timeval) -> i32 {
 /// Sleep for the duration specified in `*req`.
 /// If `rem` is non-null, any remaining time after interruption is written
 /// there (always zero in current implementation). Returns 0 on success.
-pub unsafe fn posix_nanosleep(req: *const trona::types::Timespec, rem: *mut trona::types::Timespec) -> i32 {
+pub unsafe fn posix_nanosleep(req: *const trona::types::core::Timespec, rem: *mut trona::types::core::Timespec) -> i32 {
     unsafe {
         let seconds = (*req).tv_sec;
         let nanos = (*req).tv_nsec;

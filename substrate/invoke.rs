@@ -118,11 +118,11 @@ pub fn tcb_set_tls_base(tcb: Cap, tls_base: u64) -> i32 {
     invoke(tcb, TCB_SET_TLS_BASE, tls_base, 0, 0, 0).error as i32
 }
 
-/// Set the signal dispatcher entry point for a TCB.
-/// When non-zero, the kernel injects a signal frame on the user stack
+/// Set the notification dispatcher entry point for a TCB.
+/// When non-zero, the kernel injects a notification frame on the user stack
 /// and redirects execution to this address instead of returning EINTR.
-pub fn tcb_set_signal_dispatcher(tcb: Cap, dispatcher: u64) -> i32 {
-    invoke(tcb, TCB_SET_SIGNAL_DISPATCHER, dispatcher, 0, 0, 0).error as i32
+pub fn tcb_set_notification_dispatcher(tcb: Cap, dispatcher: u64) -> i32 {
+    invoke(tcb, TCB_SET_NOTIFICATION_DISPATCHER, dispatcher, 0, 0, 0).error as i32
 }
 
 // ---- SchedContext operations ----
@@ -184,8 +184,8 @@ pub fn vspace_walk_result_header() -> Option<(u64, u64)> {
     unsafe {
         let ipc_words = walk_ipc_words()?;
         Some((
-            core::ptr::read_volatile(ipc_words),
-            core::ptr::read_volatile(ipc_words.add(1)),
+            ::core::ptr::read_volatile(ipc_words),
+            ::core::ptr::read_volatile(ipc_words.add(1)),
         ))
     }
 }
@@ -196,15 +196,15 @@ pub fn vspace_walk_result_entry(index: usize) -> Option<(u64, u64, u64)> {
         let ipc_words = walk_ipc_words()?;
         let offset = VSPACE_WALK_ENTRY_BASE_WORD
             .checked_add(index.checked_mul(VSPACE_WALK_ENTRY_WORDS)?)?;
-        let ipc_words_total = core::mem::size_of::<IpcBuffer>() / core::mem::size_of::<u64>();
+        let ipc_words_total = ::core::mem::size_of::<IpcBuffer>() / ::core::mem::size_of::<u64>();
         if offset + 2 >= ipc_words_total {
             return None;
         }
 
         Some((
-            core::ptr::read_volatile(ipc_words.add(offset)),
-            core::ptr::read_volatile(ipc_words.add(offset + 1)),
-            core::ptr::read_volatile(ipc_words.add(offset + 2)),
+            ::core::ptr::read_volatile(ipc_words.add(offset)),
+            ::core::ptr::read_volatile(ipc_words.add(offset + 1)),
+            ::core::ptr::read_volatile(ipc_words.add(offset + 2)),
         ))
     }
 }
@@ -610,6 +610,17 @@ pub fn mo_has_page(mo: Cap, page_index: u64) -> (i32, bool) {
 /// `vaddr` is the target virtual address (page-aligned).
 /// `mo_offset` is the page offset within the MO.
 /// `count_and_flags` encodes (count << 32) | flags.
+pub fn vspace_map_mo_with_count(
+    vspace: Cap,
+    mo_cap: u64,
+    vaddr: u64,
+    mo_offset: u64,
+    count_and_flags: u64,
+) -> (i32, u64) {
+    let r = invoke(vspace, VSPACE_MAP_MO, mo_cap, vaddr, mo_offset, count_and_flags);
+    (r.error as i32, r.value)
+}
+
 pub fn vspace_map_mo(
     vspace: Cap,
     mo_cap: u64,
@@ -617,7 +628,7 @@ pub fn vspace_map_mo(
     mo_offset: u64,
     count_and_flags: u64,
 ) -> i32 {
-    invoke(vspace, VSPACE_MAP_MO, mo_cap, vaddr, mo_offset, count_and_flags).error as i32
+    vspace_map_mo_with_count(vspace, mo_cap, vaddr, mo_offset, count_and_flags).0
 }
 
 /// Unmap a MO range from a VSpace.

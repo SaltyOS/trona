@@ -2,8 +2,12 @@
 //! POSIX fcntl, isatty, ioctl, chdir, getcwd, tcgetattr, shm operations.
 
 use super::{pack_path, CAP_VFS_EP};
-use trona::consts::*;
-use trona::types::*;
+use trona::consts::kernel::*;
+use trona::consts::posix::*;
+use trona::protocol::*;
+use trona::protocol::posix::*;
+use trona::types::core::*;
+use trona::types::posix::*;
 
 #[repr(C)]
 struct IoctlWinsize {
@@ -138,7 +142,7 @@ pub unsafe fn posix_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_FCNTL;
+        msg.label = VFS_FCNTL;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = cmd as u64;
@@ -160,7 +164,7 @@ pub unsafe fn posix_isatty(fd: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_ISATTY;
+        msg.label = VFS_ISATTY;
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
@@ -180,7 +184,7 @@ pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_IOCTL;
+        msg.label = VFS_IOCTL;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = request;
@@ -215,13 +219,13 @@ pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
                     return -22;
                 }
                 let ifc = arg as *mut IoctlIfconf;
-                if (*ifc).len < core::mem::size_of::<IoctlIfreq>() as i32 {
-                    (*ifc).len = core::mem::size_of::<IoctlIfreq>() as i32;
+                if (*ifc).len < ::core::mem::size_of::<IoctlIfreq>() as i32 {
+                    (*ifc).len = ::core::mem::size_of::<IoctlIfreq>() as i32;
                     return 0;
                 }
                 let dst = (*ifc).data.req;
                 if dst.is_null() {
-                    (*ifc).len = core::mem::size_of::<IoctlIfreq>() as i32;
+                    (*ifc).len = ::core::mem::size_of::<IoctlIfreq>() as i32;
                     return 0;
                 }
                 (*dst).name = [0; 16];
@@ -230,7 +234,7 @@ pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
                 (*dst).name[2] = b'h';
                 (*dst).name[3] = b'0';
                 write_sockaddr_in(&mut (*dst).data.addr, reply.regs[0] as u32);
-                (*ifc).len = core::mem::size_of::<IoctlIfreq>() as i32;
+                (*ifc).len = ::core::mem::size_of::<IoctlIfreq>() as i32;
                 return 0;
             }
             SIOCGIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR | SIOCGIFNETMASK | SIOCGIFINDEX => {
@@ -288,7 +292,7 @@ pub unsafe fn posix_chdir(path: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_CHDIR;
+        msg.label = VFS_CHDIR;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
@@ -313,7 +317,7 @@ pub unsafe fn posix_getcwd(buf: *mut u8, size: u64) -> i32 {
 
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_GETCWD;
+        msg.label = VFS_GETCWD;
         msg.length = 1;
         msg.regs[0] = size;
 
@@ -346,11 +350,11 @@ pub unsafe fn posix_getcwd(buf: *mut u8, size: u64) -> i32 {
 
 /// Get terminal attributes for fd into `*termios_p`.
 /// Returns 0 on success, -1 on error.
-pub unsafe fn posix_tcgetattr(fd: i32, termios_p: *mut trona::types::Termios) -> i32 {
+pub unsafe fn posix_tcgetattr(fd: i32, termios_p: *mut Termios) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_TCGETATTR;
+        msg.label = VFS_TCGETATTR;
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
@@ -386,12 +390,12 @@ pub unsafe fn posix_tcgetattr(fd: i32, termios_p: *mut trona::types::Termios) ->
 pub unsafe fn posix_tcsetattr(
     fd: i32,
     action: i32,
-    termios_p: *const trona::types::Termios,
+    termios_p: *const Termios,
 ) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_TCSETATTR;
+        msg.label = VFS_TCSETATTR;
         msg.length = 11;
         msg.regs[0] = fd as u64;
         msg.regs[1] = action as u64;
@@ -432,7 +436,7 @@ pub unsafe fn posix_shm_open(name: *const u8, flags: i32) -> i32 {
         };
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_SHM_OPEN;
+        msg.label = VFS_SHM_OPEN;
         msg.regs[0] = flags as u64;
         let name_len = pack_path(&raw mut msg, 1, bare, 128);
         msg.length = 2 + ((name_len as u64 + 7) / 8);
@@ -460,7 +464,7 @@ pub unsafe fn posix_shm_unlink(name: *const u8) -> i32 {
         };
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_SHM_UNLINK;
+        msg.label = VFS_SHM_UNLINK;
         let name_len = pack_path(&raw mut msg, 0, bare, 128);
         msg.length = 1 + ((name_len as u64 + 7) / 8);
 
@@ -477,12 +481,12 @@ pub unsafe fn posix_shm_unlink(name: *const u8) -> i32 {
 
 /// Framebuffer ioctl wrapper.
 ///
-/// Sends POSIX_VFS_IOCTL with an fb-specific command and unpacks up to 5 result registers.
+/// Sends VFS_IOCTL with an fb-specific command and unpacks up to 5 result registers.
 pub unsafe fn posix_fb_ioctl(fd: i32, cmd: u64, result: *mut [u64; 5]) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_IOCTL;
+        msg.label = VFS_IOCTL;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = cmd;
@@ -510,7 +514,7 @@ static mut UMASK_CACHE: u32 = 0o022;
 
 /// Return the current cached umask value.
 pub(crate) unsafe fn get_umask() -> u32 {
-    unsafe { core::ptr::read_volatile(&raw const UMASK_CACHE) }
+    unsafe { ::core::ptr::read_volatile(&raw const UMASK_CACHE) }
 }
 
 /// Set the file creation mask. Returns the previous mask.
@@ -522,18 +526,18 @@ pub unsafe fn posix_umask(mask: u32) -> u32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_UMASK;
+        msg.label = PM_UMASK;
         msg.length = 1;
         msg.regs[0] = mask as u64;
 
         let cap_procmgr: u64 = 3; // CAP_PROCMGR_EP
         let err = crate::ipc_call_retry(cap_procmgr, &raw const msg, &raw mut reply);
         let old = if err != 0 || reply.label != TRONA_OK {
-            let prev = core::ptr::read_volatile(&raw const UMASK_CACHE);
-            core::ptr::write_volatile(&raw mut UMASK_CACHE, mask & 0o777);
+            let prev = ::core::ptr::read_volatile(&raw const UMASK_CACHE);
+            ::core::ptr::write_volatile(&raw mut UMASK_CACHE, mask & 0o777);
             prev
         } else {
-            core::ptr::write_volatile(&raw mut UMASK_CACHE, mask & 0o777);
+            ::core::ptr::write_volatile(&raw mut UMASK_CACHE, mask & 0o777);
             reply.regs[0] as u32
         };
         old
@@ -546,7 +550,7 @@ pub unsafe fn posix_fchmod(fd: i32, mode: u32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_FCHMOD;
+        msg.label = VFS_FCHMOD;
         msg.length = 2;
         msg.regs[0] = fd as u64;
         msg.regs[1] = mode as u64;
@@ -568,7 +572,7 @@ pub unsafe fn posix_fchown(fd: i32, uid: u32, gid: u32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_FCHOWN;
+        msg.label = VFS_FCHOWN;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = uid as u64;

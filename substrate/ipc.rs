@@ -125,7 +125,7 @@ unsafe fn write_overflow_ctx(ctx: *mut IpcContext, msg: *const TronaMsg) {
         if c.ipc_buffer.is_null() {
             return;
         }
-        let n = core::cmp::min(len as i32 - 4, 16);
+        let n = ::core::cmp::min(len as i32 - 4, 16);
         for i in 0..n as usize {
             (*c.ipc_buffer).msg[6 + i] = (*msg).regs[4 + i];
         }

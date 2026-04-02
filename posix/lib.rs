@@ -33,6 +33,8 @@
 
 extern crate trona;
 
+pub mod consts;
+pub mod protocol;
 pub mod file;
 pub mod socket;
 pub mod poll;
@@ -56,12 +58,11 @@ pub use proc::*;
 pub use misc::*;
 pub use at::*;
 
-pub use trona::consts::*;
-pub use trona::types::*;
-
-// Standard child CSpace layout (set by procmgr at spawn time)
-const CAP_PROCMGR_EP: u64 = 3;
-const CAP_VFS_EP: u64 = 4;
+pub use trona::consts::kernel::*;
+pub use trona::consts::server::*;
+pub use trona::consts::posix::*;
+pub use trona::types::core::*;
+pub use trona::types::posix::*;
 
 /// Convert a server error label to a negative POSIX errno code.
 pub(crate) fn trona_err_to_posix(label: u64) -> i32 {
@@ -119,8 +120,8 @@ pub(crate) fn call_err_to_posix_i64(err: i32) -> i64 {
 /// bind, mkdir, unlink, rename, etc.
 pub(crate) unsafe fn ipc_call_retry(
     ep: u64,
-    msg: *const trona::types::TronaMsg,
-    reply: *mut trona::types::TronaMsg,
+    msg: *const trona::types::core::TronaMsg,
+    reply: *mut trona::types::core::TronaMsg,
 ) -> i32 {
     unsafe {
         loop {
@@ -130,7 +131,7 @@ pub(crate) unsafe fn ipc_call_retry(
                 msg,
                 reply,
             );
-            if err == trona::consts::TRONA_RESTART as i32 {
+            if err == trona::consts::kernel::TRONA_RESTART as i32 {
                 continue;
             }
             return err;
@@ -146,8 +147,8 @@ pub(crate) unsafe fn ipc_call_retry(
 /// getuid, getcwd, access, lseek, etc.
 pub(crate) unsafe fn ipc_call_retry_idempotent(
     ep: u64,
-    msg: *const trona::types::TronaMsg,
-    reply: *mut trona::types::TronaMsg,
+    msg: *const trona::types::core::TronaMsg,
+    reply: *mut trona::types::core::TronaMsg,
 ) -> i32 {
     unsafe {
         loop {
@@ -157,8 +158,8 @@ pub(crate) unsafe fn ipc_call_retry_idempotent(
                 msg,
                 reply,
             );
-            if err == trona::consts::TRONA_RESTART as i32
-                || err == trona::consts::TRONA_INTERRUPTED as i32
+            if err == trona::consts::kernel::TRONA_RESTART as i32
+                || err == trona::consts::kernel::TRONA_INTERRUPTED as i32
             {
                 continue;
             }
@@ -193,17 +194,17 @@ pub(crate) unsafe fn pack_path(msg: *mut TronaMsg, offset: usize, path: *const u
 // Signal global state
 // ---------------------------------------------------------------------------
 
-use trona::consts::NSIG;
+// NSIG is already in scope from `pub use trona::consts::posix::*;` above
 
 /// Per-signal handler function pointers (indexed by signal number).
 /// `SIG_DFL` (0) and `SIG_IGN` (1) are special sentinel values.
 #[unsafe(no_mangle)]
-pub static __sig_handlers: [core::sync::atomic::AtomicUsize; NSIG] =
-    [const { core::sync::atomic::AtomicUsize::new(0) }; NSIG];
+pub static __sig_handlers: [::core::sync::atomic::AtomicUsize; NSIG] =
+    [const { ::core::sync::atomic::AtomicUsize::new(0) }; NSIG];
 
 /// Atomic flag: 1 once signal infrastructure has been initialized.
 #[unsafe(no_mangle)]
-pub static __sig_initialized: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+pub static __sig_initialized: ::core::sync::atomic::AtomicI32 = ::core::sync::atomic::AtomicI32::new(0);
 
 /// Bitmask of currently blocked signals (bit N = signal N blocked).
 #[unsafe(no_mangle)]
@@ -238,8 +239,9 @@ pub static mut __sig_last_restart: bool = false;
 /// or -1 on failure. The child resumes at `child_entry` (never returns here).
 #[unsafe(no_mangle)]
 pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
-    use trona::consts::*;
-    use trona::types::*;
+    use trona::consts::kernel::*;
+    use trona::protocol::*;
+    use trona::types::core::*;
 
     if saved_rsp == 0 || child_entry == 0 {
         return -1;
@@ -250,7 +252,7 @@ pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
 
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_PM_FORK;
+        msg.label = PM_FORK;
         msg.regs[0] = saved_rsp;
         msg.regs[1] = child_entry;
 
@@ -338,7 +340,7 @@ pub extern "C" fn trona_socketpair(fds: *mut i32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_posix_poll(fds: *mut trona::types::PollFd, nfds: u32, timeout: i32) -> i32 {
+pub extern "C" fn trona_posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
     unsafe { poll::posix_poll(fds, nfds, timeout) }
 }
 
@@ -445,17 +447,17 @@ pub extern "C" fn trona_getgroups(size: i32, list: *mut i32) -> i32 {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_clock_gettime(clock_id: i32, ts: *mut trona::types::Timespec) -> i32 {
+pub extern "C" fn trona_clock_gettime(clock_id: i32, ts: *mut trona::types::core::Timespec) -> i32 {
     unsafe { proc::posix_clock_gettime(clock_id, ts) }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_gettimeofday(tv: *mut trona::types::Timeval) -> i32 {
+pub extern "C" fn trona_gettimeofday(tv: *mut trona::types::core::Timeval) -> i32 {
     unsafe { proc::posix_gettimeofday(tv) }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_nanosleep(req: *const trona::types::Timespec, rem: *mut trona::types::Timespec) -> i32 {
+pub extern "C" fn trona_nanosleep(req: *const trona::types::core::Timespec, rem: *mut trona::types::core::Timespec) -> i32 {
     unsafe { proc::posix_nanosleep(req, rem) }
 }
 
@@ -474,12 +476,12 @@ pub extern "C" fn trona_sleep(seconds: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_tcgetattr(fd: i32, termios_p: *mut trona::types::Termios) -> i32 {
+pub extern "C" fn trona_tcgetattr(fd: i32, termios_p: *mut Termios) -> i32 {
     unsafe { misc::posix_tcgetattr(fd, termios_p) }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_tcsetattr(fd: i32, action: i32, termios_p: *const trona::types::Termios) -> i32 {
+pub extern "C" fn trona_tcsetattr(fd: i32, action: i32, termios_p: *const Termios) -> i32 {
     unsafe { misc::posix_tcsetattr(fd, action, termios_p) }
 }
 
@@ -494,7 +496,7 @@ pub extern "C" fn trona_epoll_ctl(
     epfd: i32,
     op: i32,
     fd: i32,
-    event: *const trona::types::EpollEvent,
+    event: *const EpollEvent,
 ) -> i32 {
     unsafe {
         let (events, data) = if !event.is_null() {
@@ -509,7 +511,7 @@ pub extern "C" fn trona_epoll_ctl(
 #[unsafe(no_mangle)]
 pub extern "C" fn trona_epoll_wait(
     epfd: i32,
-    events: *mut trona::types::EpollEvent,
+    events: *mut EpollEvent,
     maxevents: i32,
     timeout: i32,
 ) -> i32 {
@@ -551,7 +553,7 @@ pub extern "C" fn trona_pthread_create(
     start_fn: unsafe extern "C" fn(*mut u8) -> *mut u8,
     arg: *mut u8,
 ) -> i32 {
-    unsafe { pthread::pthread_create(thread_out, core::ptr::null(), start_fn, arg) }
+    unsafe { pthread::pthread_create(thread_out, ::core::ptr::null(), start_fn, arg) }
 }
 
 #[unsafe(no_mangle)]
@@ -592,12 +594,12 @@ pub extern "C" fn trona_dns_resolve(hostname: *const u8, hostname_len: usize) ->
     if hostname.is_null() || hostname_len == 0 || hostname_len > 120 {
         return 0;
     }
-    let slice = unsafe { core::slice::from_raw_parts(hostname, hostname_len) };
+    let slice = unsafe { ::core::slice::from_raw_parts(hostname, hostname_len) };
     unsafe { dns::dns_resolve(slice) }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_getaddrinfo(node: *const u8, result: *mut trona::types::DnsAddrInfo) -> i32 {
+pub extern "C" fn trona_getaddrinfo(node: *const u8, result: *mut DnsAddrInfo) -> i32 {
     unsafe { dns::posix_getaddrinfo(node, result) }
 }
 
@@ -605,12 +607,12 @@ pub extern "C" fn trona_getaddrinfo(node: *const u8, result: *mut trona::types::
 pub extern "C" fn trona_dns_resolve_multi(
     hostname: *const u8,
     hostname_len: usize,
-    result: *mut trona::types::DnsResult,
+    result: *mut DnsResult,
 ) -> i32 {
     if hostname.is_null() || hostname_len == 0 || hostname_len > 120 || result.is_null() {
         return -1;
     }
-    let slice = unsafe { core::slice::from_raw_parts(hostname, hostname_len) };
+    let slice = unsafe { ::core::slice::from_raw_parts(hostname, hostname_len) };
     let r = unsafe { dns::dns_resolve_multi(slice) };
     unsafe { *result = r; }
     if r.count == 0 { -1 } else { 0 }

@@ -6,9 +6,11 @@
 //! and subsequent reads transfer data through the SHM instead of packing
 //! 152 bytes into IPC registers per round-trip.
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::server::*;
 use trona::ipc;
-use trona::types::*;
+use trona::protocol::*;
+use trona::types::core::*;
 
 /// Base address of the per-process bulk SHM mapping. 0 = not yet set up.
 static mut BULK_SHM_ADDR: u64 = 0;
@@ -21,7 +23,7 @@ static mut BULK_SHM_READY: bool = false;
 /// The setup sequence:
 /// 1. Create a SHM region via mmsrv (MM_SHM_CREATE)
 /// 2. Map it into our own address space (MM_SHM_MAP)
-/// 3. Tell VFS to map the same region (POSIX_VFS_BULK_SETUP)
+/// 3. Tell VFS to map the same region (VFS_BULK_SETUP)
 ///
 /// On any failure, returns false and the caller falls back to the legacy
 /// 152-byte-per-IPC read path.
@@ -70,7 +72,7 @@ unsafe fn ensure_bulk_shm() -> bool {
         // 3. Tell VFS to map our SHM
         msg = TronaMsg::zeroed();
         reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_BULK_SETUP;
+        msg.label = VFS_BULK_SETUP;
         msg.regs[0] = shm_id;
         msg.regs[1] = BULK_SHM_PAGES;
         msg.length = 2;
@@ -105,7 +107,7 @@ pub(crate) unsafe fn bulk_read(fd: i32, buf: *mut u8, count: u64) -> Option<usiz
             let chunk = (count - total).min(shm_size);
             let mut msg = TronaMsg::zeroed();
             let mut reply = TronaMsg::zeroed();
-            msg.label = POSIX_VFS_BULK_READ;
+            msg.label = VFS_BULK_READ;
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk;
             msg.regs[2] = 0; // shm_offset
@@ -129,7 +131,7 @@ pub(crate) unsafe fn bulk_read(fd: i32, buf: *mut u8, count: u64) -> Option<usiz
 
             // SAFETY: shm_addr is mapped with got <= shm_size bytes valid.
             // buf is caller-provided with at least count bytes writable.
-            core::ptr::copy_nonoverlapping(
+            ::core::ptr::copy_nonoverlapping(
                 shm_addr as *const u8,
                 buf.add(total as usize),
                 got as usize,
@@ -159,7 +161,7 @@ pub(crate) unsafe fn bulk_pwrite(fd: i32, buf: *const u8, count: u64, offset: u6
 
         while total < count {
             let chunk = (count - total).min(shm_size);
-            core::ptr::copy_nonoverlapping(
+            ::core::ptr::copy_nonoverlapping(
                 buf.add(total as usize),
                 shm_addr as *mut u8,
                 chunk as usize,
@@ -167,7 +169,7 @@ pub(crate) unsafe fn bulk_pwrite(fd: i32, buf: *const u8, count: u64, offset: u6
 
             let mut msg = TronaMsg::zeroed();
             let mut reply = TronaMsg::zeroed();
-            msg.label = POSIX_VFS_BULK_PWRITE;
+            msg.label = VFS_BULK_PWRITE;
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk;
             msg.regs[2] = match offset.checked_add(total) {

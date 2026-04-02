@@ -2,19 +2,23 @@
 //! DNS client API for SaltyOS.
 //!
 //! Provides hostname resolution by communicating with the dnssrv service.
-//! The default path resolves dnssrv lazily via nameserv and caches the
+//! The default path resolves dnssrv lazily via namesrv and caches the
 //! resulting endpoint capability for subsequent lookups.
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::posix::*;
+use trona::consts::server::*;
 use trona::invoke;
 use trona::ipc;
+use trona::protocol::*;
 use trona::slot_alloc;
 use crate::tls;
-use trona::types::*;
+use trona::types::core::*;
+use trona::types::posix::*;
 
 const CAP_SELF_CSPACE: u64 = 2;
 
-/// Cached dnssrv endpoint resolved lazily through nameserv.
+/// Cached dnssrv endpoint resolved lazily through namesrv.
 static mut DNSSRV_EP: Cap = 0;
 /// Dedicated receive slot reused for dnssrv endpoint lookup.
 static mut DNSSRV_LOOKUP_SLOT: Cap = 0;
@@ -46,15 +50,15 @@ unsafe fn resolve_dnssrv_ep() -> Result<Cap, u64> {
         let name = b"dnssrv";
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_NS_LOOKUP;
+        msg.label = NS_LOOKUP;
         msg.regs[0] = name.len() as u64;
         msg.length = 1 + (name.len() as u64 + 7) / 8;
 
         let dst = &raw mut msg.regs[1] as *mut u8;
-        core::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
+        ::core::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_NAMESERV_EP,
+            CAP_NAMESRV_EP,
             &raw const msg,
             &raw mut reply,
         );
@@ -86,7 +90,7 @@ unsafe fn dns_resolve_multi_result_with_ep(hostname: &[u8], dnssrv_ep: u64) -> R
         // has 20 entries (160 bytes), and hostname is at most 120 bytes, so
         // this copy stays within bounds.
         let dst = &raw mut msg.regs[1] as *mut u8;
-        core::ptr::copy_nonoverlapping(hostname.as_ptr(), dst, hostname.len());
+        ::core::ptr::copy_nonoverlapping(hostname.as_ptr(), dst, hostname.len());
         msg.length = 1 + ((hostname.len() as u64 + 7) / 8);
 
         let err = crate::ipc_call_retry_idempotent(
@@ -205,7 +209,7 @@ unsafe fn hostname_from_cstr<'a>(name: *const u8) -> Option<&'a [u8]> {
         if len == 0 || len >= 120 {
             return None;
         }
-        Some(core::slice::from_raw_parts(name, len))
+        Some(::core::slice::from_raw_parts(name, len))
     }
 }
 
@@ -275,7 +279,7 @@ pub unsafe fn posix_getaddrinfo(node: *const u8, result: *mut DnsAddrInfo) -> i3
             return -1;
         }
 
-        let hostname = core::slice::from_raw_parts(node, len);
+        let hostname = ::core::slice::from_raw_parts(node, len);
         let ip = dns_resolve(hostname);
         if ip == 0 {
             return -1;
@@ -351,14 +355,14 @@ pub unsafe fn dns_reverse_lookup(ip: u32, hostname_out: *mut u8, hostname_max: u
         }
 
         let result_len = reply.regs[0] as usize;
-        let copy_len = core::cmp::min(result_len, hostname_max);
+        let copy_len = ::core::cmp::min(result_len, hostname_max);
         if copy_len > 0 {
             if hostname_out.is_null() {
                 return 0;
             }
             // SAFETY: Reading hostname bytes packed in reply registers.
             let src = &reply.regs[1] as *const u64 as *const u8;
-            core::ptr::copy_nonoverlapping(src, hostname_out, copy_len);
+            ::core::ptr::copy_nonoverlapping(src, hostname_out, copy_len);
         }
         copy_len
     }

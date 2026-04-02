@@ -16,7 +16,7 @@ pub const CHILD_STACK_PAGES: usize = 32;
 // These define the canonical user address space layout within the first
 // 2MiB and second 2MiB windows. If code regions overflow the first window,
 // the stack is relocated to the second window.
-const IPC_BUF_BASE: u64 = 0x0000_0000_0020_0000;
+pub const IPC_BUF_BASE: u64 = 0x0000_0000_0020_0000;
 const ELF_CODE_BASE: u64 = 0x0000_0000_0021_0000;
 const DEFAULT_STACK_BASE: u64 = 0x0000_0000_003F_8000;
 const DEFAULT_SCRATCH_BASE: u64 = 0x0000_0000_003F_F000;

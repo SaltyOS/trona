@@ -6,8 +6,8 @@
 //! path, listing DT_NEEDED shared library dependencies, and reading
 //! program header info for the auxiliary vector.
 
-use trona::consts::*;
-use trona::types::*;
+use trona::consts::kernel::*;
+use trona::types::core::*;
 
 /// Check whether an ELF file has a PT_INTERP segment (i.e. needs a runtime linker).
 ///

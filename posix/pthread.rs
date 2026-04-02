@@ -24,15 +24,17 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::consts::*;
+use trona::consts::kernel::*;
+use trona::consts::posix::*;
 use trona::invoke;
 use trona::ipc;
+use trona::protocol::*;
 use trona::serial;
 use trona::slot_alloc;
 use trona::syscall::{futex_wait, futex_wake};
 use crate::tls::{self, ThreadLocalBlock};
-use trona::types::*;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use trona::types::core::*;
+use ::core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Maximum concurrent threads per process (slot 0 = main thread)
 const MAX_THREADS: usize = 64;
@@ -147,14 +149,14 @@ impl ThreadControl {
             state: AtomicU32::new(TC_UNUSED),
             generation: AtomicU32::new(0),
             join_futex: AtomicU32::new(0),
-            exit_value: core::ptr::null_mut(),
+            exit_value: ::core::ptr::null_mut(),
             thread_id: 0,
             stack_base: 0,
             stack_size: 0,
             tcb_cap: 0,
             sc_cap: 0,
             frame_cap: 0,
-            tls_ptr: core::ptr::null_mut(),
+            tls_ptr: ::core::ptr::null_mut(),
             ipc_buf_vaddr: 0,
         }
     }
@@ -350,7 +352,7 @@ pub unsafe fn pthread_create(
 
         // Map stack pages via mmsrv mmap
         let stack_addr = crate::mm::posix_mmap(
-            core::ptr::null_mut(),
+            ::core::ptr::null_mut(),
             stack_size,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
@@ -370,7 +372,7 @@ pub unsafe fn pthread_create(
         (*tc).stack_base = stack_base;
         (*tc).stack_size = stack_size;
         (*tc).join_futex.store(0, Ordering::Relaxed);
-        (*tc).exit_value = core::ptr::null_mut();
+        (*tc).exit_value = ::core::ptr::null_mut();
 
         // If initially detached, update state
         if detach_state == 1 {
@@ -380,15 +382,15 @@ pub unsafe fn pthread_create(
         // 4. Place the per-thread TLS block at the top of the stack.
         let stack_top = stack_base + stack_size;
         let tls_memsz = tls::static_tls_total_memsz();
-        let tls_align = core::cmp::max(tls::static_tls_align(), 16);
-        let tcb_size = core::mem::size_of::<ThreadLocalBlock>() as u64;
-        let runtime_tcb_align = core::mem::align_of::<ThreadLocalBlock>() as u64;
+        let tls_align = ::core::cmp::max(tls::static_tls_align(), 16);
+        let tcb_size = ::core::mem::size_of::<ThreadLocalBlock>() as u64;
+        let runtime_tcb_align = ::core::mem::align_of::<ThreadLocalBlock>() as u64;
 
         #[cfg(target_arch = "x86_64")]
         let (tp, tls_block_base, tls_block_end, tls) = {
             let tcb_addr = align_down(
                 stack_top.saturating_sub(tcb_size),
-                core::cmp::max(tls_align, runtime_tcb_align),
+                ::core::cmp::max(tls_align, runtime_tcb_align),
             );
             let tls_block_base = tcb_addr.saturating_sub(tls_memsz);
             (
@@ -419,7 +421,7 @@ pub unsafe fn pthread_create(
             )
         };
 
-        core::ptr::write_bytes(
+        ::core::ptr::write_bytes(
             tls_block_base as *mut u8,
             0,
             tls_block_end.saturating_sub(tls_block_base) as usize,
@@ -594,14 +596,14 @@ pub unsafe fn pthread_create(
 #[unsafe(naked)]
 pub unsafe extern "C" fn pthread_entry_trampoline() {
     #[cfg(target_arch = "x86_64")]
-    core::arch::naked_asm!(
+    ::core::arch::naked_asm!(
         "pop rdi",
         "pop rsi",
         "jmp {helper}",
         helper = sym pthread_trampoline_helper,
     );
     #[cfg(target_arch = "aarch64")]
-    core::arch::naked_asm!(
+    ::core::arch::naked_asm!(
         "ldp x0, x1, [sp], #16",
         "b {helper}",
         helper = sym pthread_trampoline_helper,
@@ -875,7 +877,7 @@ pub unsafe fn pthread_cancel(thread: PthreadT) -> i32 {
             return -1;
         }
         // Set cancellation flag
-        core::ptr::write_volatile(&raw mut (*tls).cancel_pending, 1);
+        ::core::ptr::write_volatile(&raw mut (*tls).cancel_pending, 1);
         // Wake thread if blocked on a cancellation-point futex.
         // Spurious wake is safe — all cancellation points re-check their conditions.
         let futex_addr = (*tls).blocked_futex_addr.load(Ordering::Acquire);
@@ -923,7 +925,7 @@ pub unsafe fn pthread_setcanceltype(ctype: i32, oldtype: *mut i32) -> i32 {
 pub unsafe fn pthread_testcancel() {
     if let Some(tls) = tls::current_tls() {
         unsafe {
-            let pending = core::ptr::read_volatile(&raw const (*tls).cancel_pending);
+            let pending = ::core::ptr::read_volatile(&raw const (*tls).cancel_pending);
             if pending != 0 && (*tls).cancel_state == 0 {
                 run_cleanup_handlers(tls);
                 pthread_exit(PTHREAD_CANCELED);

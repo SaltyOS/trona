@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! POSIX poll, select, and epoll wrappers.
 
-use trona::consts::*;
-use trona::types::*;
+use trona::consts::kernel::*;
+use trona::protocol::*;
+use trona::types::core::*;
+use trona::types::posix::*;
 use super::CAP_VFS_EP;
 
 /// Wait for events on a set of file descriptors (max 8 per call).
@@ -15,7 +17,7 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_POLL;
+        msg.label = VFS_POLL;
 
         let actual_nfds = if nfds > 8 { 8 } else { nfds };
         msg.regs[0] = actual_nfds as u64;
@@ -65,10 +67,10 @@ pub unsafe fn posix_select(nfds: i32, readfds: *mut u64, writefds: *mut u64, tim
         for fd in 0..max_fd {
             let mut events: i16 = 0;
             if !readfds.is_null() && (*readfds & (1u64 << fd)) != 0 {
-                events |= trona::consts::POLLIN;
+                events |= trona::consts::posix::POLLIN;
             }
             if !writefds.is_null() && (*writefds & (1u64 << fd)) != 0 {
-                events |= trona::consts::POLLOUT;
+                events |= trona::consts::posix::POLLOUT;
             }
             if events != 0 && count < 8 {
                 poll_fds[count as usize].fd = fd;
@@ -96,12 +98,12 @@ pub unsafe fn posix_select(nfds: i32, readfds: *mut u64, writefds: *mut u64, tim
                 let fd = poll_fds[i].fd;
                 let mut counted = false;
                 if !readfds.is_null()
-                    && (poll_fds[i].revents & (trona::consts::POLLIN | trona::consts::POLLHUP | trona::consts::POLLERR)) != 0
+                    && (poll_fds[i].revents & (trona::consts::posix::POLLIN | trona::consts::posix::POLLHUP | trona::consts::posix::POLLERR)) != 0
                 {
                     *readfds |= 1u64 << fd;
                     if !counted { ready += 1; counted = true; }
                 }
-                if !writefds.is_null() && (poll_fds[i].revents & trona::consts::POLLOUT) != 0 {
+                if !writefds.is_null() && (poll_fds[i].revents & trona::consts::posix::POLLOUT) != 0 {
                     *writefds |= 1u64 << fd;
                     if !counted { ready += 1; }
                 }
@@ -116,7 +118,7 @@ pub unsafe fn posix_epoll_create() -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_EPOLL_CREATE;
+        msg.label = VFS_EPOLL_CREATE;
         msg.length = 0;
 
         let err = crate::ipc_call_retry(
@@ -140,7 +142,7 @@ pub unsafe fn posix_epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32, data: u6
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_EPOLL_CTL;
+        msg.label = VFS_EPOLL_CTL;
         msg.length = 5;
         msg.regs[0] = epfd as u64;
         msg.regs[1] = op as u64;
@@ -169,14 +171,14 @@ pub unsafe fn posix_epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32, data: u6
 /// Returns the number of ready events written to `events`, or -1 on error.
 pub unsafe fn posix_epoll_wait(
     epfd: i32,
-    events: *mut trona::types::EpollEvent,
+    events: *mut EpollEvent,
     maxevents: i32,
     timeout: i32,
 ) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_EPOLL_WAIT;
+        msg.label = VFS_EPOLL_WAIT;
         msg.length = 3;
         msg.regs[0] = epfd as u64;
         msg.regs[1] = maxevents as u64;

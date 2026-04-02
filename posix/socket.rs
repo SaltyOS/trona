@@ -3,8 +3,12 @@
 //!
 //! Supports both AF_UNIX (path-based) and AF_INET (ip+port-based) sockets.
 
-use trona::consts::*;
-use trona::types::*;
+use trona::consts::kernel::*;
+use trona::consts::posix::*;
+use trona::consts::server::*;
+use trona::protocol::*;
+use trona::types::core::*;
+use trona::types::posix::*;
 use super::{pack_path, CAP_VFS_EP};
 
 const POSIX_MSG_PEEK: i32 = 0x02;
@@ -45,7 +49,7 @@ unsafe fn pack_sockopt_value(optval: *const u8, optlen: u32) -> Result<u64, i32>
     // SAFETY: `optval` is caller-provided and validated non-null. We cap copies
     // to 8 bytes and write into a local `u64` buffer.
     unsafe {
-        core::ptr::copy_nonoverlapping(optval, dst, optlen as usize);
+        ::core::ptr::copy_nonoverlapping(optval, dst, optlen as usize);
     }
     Ok(value)
 }
@@ -56,7 +60,7 @@ pub unsafe fn posix_socket(domain: i32, sock_type: i32, protocol: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_SOCKET;
+        msg.label = VFS_SOCKET;
         msg.length = 3;
         msg.regs[0] = domain as u64;
         msg.regs[1] = sock_type as u64;
@@ -89,7 +93,7 @@ pub unsafe fn posix_bind(fd: i32, addr: *const u8, addr_len: u32) -> i32 {
         let family = *(addr as *const u16);
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_BIND;
+        msg.label = VFS_BIND;
         msg.regs[0] = fd as u64;
 
         if family == AF_INET as u16 {
@@ -126,7 +130,7 @@ pub unsafe fn posix_listen(fd: i32, backlog: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_LISTEN;
+        msg.label = VFS_LISTEN;
         msg.length = 2;
         msg.regs[0] = fd as u64;
         msg.regs[1] = backlog as u64;
@@ -148,7 +152,7 @@ pub unsafe fn posix_accept(fd: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_ACCEPT;
+        msg.label = VFS_ACCEPT;
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
@@ -182,7 +186,7 @@ pub unsafe fn posix_connect(fd: i32, addr: *const u8, addr_len: u32) -> i32 {
         let family = *(addr as *const u16);
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_CONNECT;
+        msg.label = VFS_CONNECT;
         msg.regs[0] = fd as u64;
 
         if family == AF_INET as u16 {
@@ -221,7 +225,7 @@ pub unsafe fn posix_shutdown(fd: i32, how: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_SHUTDOWN;
+        msg.label = VFS_SHUTDOWN;
         msg.length = 2;
         msg.regs[0] = fd as u64;
         msg.regs[1] = how as u64;
@@ -243,13 +247,13 @@ pub unsafe fn posix_getsockname(fd: i32, addr: *mut u8, addr_len: *mut u32) -> i
         if addr.is_null() || addr_len.is_null() {
             return -14; // EFAULT
         }
-        if *addr_len < core::mem::size_of::<SockAddrIn>() as u32 {
+        if *addr_len < ::core::mem::size_of::<SockAddrIn>() as u32 {
             return -22; // EINVAL
         }
 
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_GETSOCKNAME;
+        msg.label = VFS_GETSOCKNAME;
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
@@ -265,7 +269,7 @@ pub unsafe fn posix_getsockname(fd: i32, addr: *mut u8, addr_len: *mut u32) -> i
         sa.family = AF_INET as u16;
         sa.port = reply.regs[1] as u16;
         sa.addr = reply.regs[0] as u32;
-        *addr_len = core::mem::size_of::<SockAddrIn>() as u32;
+        *addr_len = ::core::mem::size_of::<SockAddrIn>() as u32;
         0
     }
 }
@@ -276,13 +280,13 @@ pub unsafe fn posix_getpeername(fd: i32, addr: *mut u8, addr_len: *mut u32) -> i
         if addr.is_null() || addr_len.is_null() {
             return -14; // EFAULT
         }
-        if *addr_len < core::mem::size_of::<SockAddrIn>() as u32 {
+        if *addr_len < ::core::mem::size_of::<SockAddrIn>() as u32 {
             return -22; // EINVAL
         }
 
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_GETPEERNAME;
+        msg.label = VFS_GETPEERNAME;
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
@@ -298,7 +302,7 @@ pub unsafe fn posix_getpeername(fd: i32, addr: *mut u8, addr_len: *mut u32) -> i
         sa.family = AF_INET as u16;
         sa.port = reply.regs[1] as u16;
         sa.addr = reply.regs[0] as u32;
-        *addr_len = core::mem::size_of::<SockAddrIn>() as u32;
+        *addr_len = ::core::mem::size_of::<SockAddrIn>() as u32;
         0
     }
 }
@@ -319,7 +323,7 @@ pub unsafe fn posix_setsockopt(
 
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_SETSOCKOPT;
+        msg.label = VFS_SETSOCKOPT;
         msg.length = 5;
         msg.regs[0] = fd as u64;
         msg.regs[1] = level as u64;
@@ -353,7 +357,7 @@ pub unsafe fn posix_getsockopt(
 
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_GETSOCKOPT;
+        msg.label = VFS_GETSOCKOPT;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = level as u64;
@@ -369,9 +373,9 @@ pub unsafe fn posix_getsockopt(
 
         let value = reply.regs[0];
         let actual_len = reply.regs[1] as u32;
-        let copy_len = core::cmp::min(*optlen, actual_len) as usize;
+        let copy_len = ::core::cmp::min(*optlen, actual_len) as usize;
         let src = &raw const value as *const u64 as *const u8;
-        core::ptr::copy_nonoverlapping(src, optval, copy_len);
+        ::core::ptr::copy_nonoverlapping(src, optval, copy_len);
         *optlen = actual_len;
         0
     }
@@ -383,7 +387,7 @@ pub unsafe fn posix_socketpair(fds: *mut i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_SOCKPAIR;
+        msg.label = VFS_SOCKPAIR;
         msg.length = 0;
 
         let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
@@ -410,7 +414,7 @@ pub unsafe fn posix_sendmsg(fd: i32, data: *const u8, data_len: u64, fds_to_send
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_SENDMSG;
+        msg.label = VFS_SENDMSG;
         msg.regs[0] = fd as u64;
         msg.regs[1] = data_len;
         msg.regs[2] = fd_count as u64;
@@ -458,7 +462,7 @@ pub unsafe fn posix_recvmsg(fd: i32, data: *mut u8, data_len: u64, fds_out: *mut
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_RECVMSG;
+        msg.label = VFS_RECVMSG;
         msg.length = 2;
         msg.regs[0] = fd as u64;
         msg.regs[1] = data_len;
@@ -516,7 +520,7 @@ pub unsafe fn posix_sendto(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_SENDMSG;
+        msg.label = VFS_SENDMSG;
         msg.regs[0] = fd as u64;
 
         let actual = if data_len > 120 { 120 } else { data_len };
@@ -587,7 +591,7 @@ pub unsafe fn posix_recvfrom(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_RECVMSG;
+        msg.label = VFS_RECVMSG;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = data_len as u64;
@@ -637,7 +641,7 @@ pub unsafe fn posix_recv_inet(fd: i32, data: *mut u8, data_len: usize, flags: i3
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = POSIX_VFS_RECVMSG;
+        msg.label = VFS_RECVMSG;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = data_len as u64;
@@ -656,7 +660,7 @@ pub unsafe fn posix_recv_inet(fd: i32, data: *mut u8, data_len: usize, flags: i3
 
         let actual_data = reply.regs[0] as usize;
         let src = &reply.regs[1] as *const u64 as *const u8;
-        let copy_len = core::cmp::min(actual_data, data_len);
+        let copy_len = ::core::cmp::min(actual_data, data_len);
         for i in 0..copy_len {
             *data.add(i) = *src.add(i);
         }
@@ -687,7 +691,7 @@ pub unsafe fn posix_recvmsg_inet(
             flags |= INET_RECV_FLAG_WANT_TIMESTAMP;
         }
 
-        msg.label = POSIX_VFS_RECVMSG;
+        msg.label = VFS_RECVMSG;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = data_len;
@@ -712,7 +716,7 @@ pub unsafe fn posix_recvmsg_inet(
         }
 
         let src = &reply.regs[4] as *const u64 as *const u8;
-        let copy_len = core::cmp::min(actual_data, data_len as usize);
+        let copy_len = ::core::cmp::min(actual_data, data_len as usize);
         for i in 0..copy_len {
             *data.add(i) = *src.add(i);
         }

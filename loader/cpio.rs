@@ -10,8 +10,8 @@
 //! All functions work on raw byte pointers (no_std compatible) and validate
 //! the "070701" magic on each header.
 
-use trona::consts::CPIO_HEADER_SIZE;
-use trona::types::{CpioEntry, CpioEntryExt};
+use trona::consts::kernel::CPIO_HEADER_SIZE;
+use trona::types::core::{CpioEntry, CpioEntryExt};
 
 /// Parse an 8-character hexadecimal field from a CPIO header.
 fn parse_hex8(bytes: *const u8) -> usize {

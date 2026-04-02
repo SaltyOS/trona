@@ -26,8 +26,8 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::types::IpcContext;
-use core::sync::atomic::{AtomicBool, Ordering};
+use trona::types::core::IpcContext;
+use ::core::sync::atomic::{AtomicBool, Ordering};
 
 /// Set to `true` after `init_main_thread_tls()` has configured the hardware
 /// thread pointer. Prevents `current_tls()` from reading an unmapped TP.
@@ -40,7 +40,7 @@ static TLS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub const MAX_ELF_TLS_SIZE: usize = 4096;
 
 // Re-export from substrate (canonical definitions live in trona::types)
-pub use trona::types::{StaticTlsModule, MAX_STATIC_TLS_MODULES};
+pub use trona::types::core::{StaticTlsModule, MAX_STATIC_TLS_MODULES};
 
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
@@ -53,7 +53,7 @@ struct AbiThreadPointerBlock {
 impl AbiThreadPointerBlock {
     const fn zeroed() -> Self {
         AbiThreadPointerBlock {
-            runtime_tcb: core::ptr::null_mut(),
+            runtime_tcb: ::core::ptr::null_mut(),
             reserved: 0,
         }
     }
@@ -94,7 +94,7 @@ pub struct ThreadLocalBlock {
     /// Futex address the thread is currently blocked on (for cancel wake).
     /// Set before futex_wait at cancellation points, cleared after return.
     /// 0 means the thread is not blocked on any cancellation-point futex.
-    pub blocked_futex_addr: core::sync::atomic::AtomicU64,
+    pub blocked_futex_addr: ::core::sync::atomic::AtomicU64,
 }
 
 /// Cleanup handler node for pthread_cleanup_push/pop.
@@ -115,18 +115,18 @@ impl ThreadLocalBlock {
     /// The caller must set `self_ptr = &mut self as *mut _` after placement.
     pub const fn zeroed() -> Self {
         ThreadLocalBlock {
-            self_ptr: core::ptr::null_mut(),
+            self_ptr: ::core::ptr::null_mut(),
             ipc_ctx: IpcContext::new(),
             thread_id: 0,
             errno: 0,
             _pad0: 0,
-            control: core::ptr::null_mut(),
+            control: ::core::ptr::null_mut(),
             cancel_state: 0,
             cancel_type: 0,
             cancel_pending: 0,
             _pad1: 0,
-            cleanup_stack: core::ptr::null_mut(),
-            blocked_futex_addr: core::sync::atomic::AtomicU64::new(0),
+            cleanup_stack: ::core::ptr::null_mut(),
+            blocked_futex_addr: ::core::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -172,7 +172,7 @@ pub const fn abi_tcb_size() -> u64 {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        core::mem::size_of::<AbiThreadPointerBlock>() as u64
+        ::core::mem::size_of::<AbiThreadPointerBlock>() as u64
     }
 }
 
@@ -190,14 +190,14 @@ pub fn static_tls_align() -> u64 {
 #[inline]
 fn static_tls_module_count() -> usize {
     let count = unsafe { *(&raw const trona::__trona_tls_module_count) as usize };
-    core::cmp::min(count, MAX_STATIC_TLS_MODULES)
+    ::core::cmp::min(count, MAX_STATIC_TLS_MODULES)
 }
 
 #[inline]
 unsafe fn static_tls_module(index: usize) -> StaticTlsModule {
     unsafe {
         let modules = (&raw const trona::__trona_tls_modules) as *const StaticTlsModule;
-        core::ptr::read(modules.add(index))
+        ::core::ptr::read(modules.add(index))
     }
 }
 
@@ -206,7 +206,7 @@ unsafe fn current_tp_value() -> u64 {
     let ptr: u64;
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        core::arch::asm!(
+        ::core::arch::asm!(
             "mov {}, fs:[0]",
             out(reg) ptr,
             options(nostack, pure, readonly)
@@ -215,7 +215,7 @@ unsafe fn current_tp_value() -> u64 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         // TPIDR_EL0 holds the thread pointer on aarch64
-        core::arch::asm!(
+        ::core::arch::asm!(
             "mrs {}, TPIDR_EL0",
             out(reg) ptr,
             options(nostack, pure, readonly)
@@ -245,7 +245,7 @@ unsafe fn runtime_tcb_from_tp(tp: u64) -> *mut ThreadLocalBlock {
     #[cfg(target_arch = "aarch64")]
     {
         if tp == 0 {
-            core::ptr::null_mut()
+            ::core::ptr::null_mut()
         } else {
             unsafe { (*(tp as *const AbiThreadPointerBlock)).runtime_tcb }
         }
@@ -274,14 +274,14 @@ pub(crate) unsafe fn initialize_static_tls_for_tp(tp: u64) {
 
     unsafe {
         let tls_base = default_tls_base_from_tp(tp);
-        core::ptr::write_bytes(tls_base as *mut u8, 0, tls_memsz as usize);
+        ::core::ptr::write_bytes(tls_base as *mut u8, 0, tls_memsz as usize);
 
         let module_count = static_tls_module_count();
         if module_count == 0 {
             let tls_filesz = *(&raw const trona::__trona_tls_filesz);
             let tls_template = *(&raw const trona::__trona_tls_template);
             if tls_template != 0 && tls_filesz > 0 {
-                core::ptr::copy_nonoverlapping(
+                ::core::ptr::copy_nonoverlapping(
                     tls_template as *const u8,
                     tls_base as *mut u8,
                     tls_filesz as usize,
@@ -298,7 +298,7 @@ pub(crate) unsafe fn initialize_static_tls_for_tp(tp: u64) {
 
             if module.template_addr != 0 && module.filesz > 0 {
                 let dst = tp.wrapping_add(module.tp_offset as u64) as *mut u8;
-                core::ptr::copy_nonoverlapping(
+                ::core::ptr::copy_nonoverlapping(
                     module.template_addr as *const u8,
                     dst,
                     module.filesz as usize,
