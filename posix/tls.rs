@@ -95,6 +95,17 @@ pub struct ThreadLocalBlock {
     /// Set before futex_wait at cancellation points, cleared after return.
     /// 0 means the thread is not blocked on any cancellation-point futex.
     pub blocked_futex_addr: ::core::sync::atomic::AtomicU64,
+
+    // ----- basaltc per-thread state (appended to preserve existing offsets) -----
+
+    /// Per-thread strtok() save pointer (used by basaltc strtok).
+    pub strtok_save: *mut u8,
+    /// Per-thread `struct tm` buffer for gmtime()/localtime() (56 bytes).
+    pub libc_tm_buf: [u8; 56],
+    /// Per-thread asctime() buffer (64 bytes).
+    pub libc_asctime_buf: [u8; 64],
+    /// Per-thread ctime() buffer (64 bytes).
+    pub libc_ctime_buf: [u8; 64],
 }
 
 /// Cleanup handler node for pthread_cleanup_push/pop.
@@ -127,6 +138,10 @@ impl ThreadLocalBlock {
             _pad1: 0,
             cleanup_stack: ::core::ptr::null_mut(),
             blocked_futex_addr: ::core::sync::atomic::AtomicU64::new(0),
+            strtok_save: ::core::ptr::null_mut(),
+            libc_tm_buf: [0; 56],
+            libc_asctime_buf: [0; 64],
+            libc_ctime_buf: [0; 64],
         }
     }
 }
