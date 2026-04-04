@@ -401,6 +401,7 @@ typedef struct {
 #define AT_TRONA_SLOT_COUNT    0x1008
 #define AT_TRONA_CSPACE_NTFN   0x100A
 #define AT_TRONA_MM_EP         0x100B
+#define AT_TRONA_SC_CAP        0x100E
 #define AT_SALTYOS_KERNEL32_BASE 0x2003
 #define AT_SALTYOS_KERNEL32_SIZE 0x2004
 
@@ -429,6 +430,7 @@ struct pe_rtld_state {
     uint64_t slot_base;
     uint64_t slot_count;
     uint64_t cspace_ntfn;
+    uint64_t sc_cap;
 };
 
 /* Convert PE section characteristics to VSpace flags (W^X enforced) */

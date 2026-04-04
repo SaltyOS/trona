@@ -112,6 +112,22 @@ unsafe fn sig_init() {
     }
 }
 
+/// Reinstall per-TCB signal delivery state in a fork child.
+///
+/// The child inherits the process-global POSIX signal tables, but it runs on a
+/// fresh TCB with a fresh signal notification cap. Re-run the one-time signal
+/// init against the child's TCB so kernel notification delivery and userspace
+/// signal state stay consistent after fork.
+pub(crate) unsafe fn sig_reinit_after_fork() {
+    if crate::__sig_initialized.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+
+    crate::__sig_initialized.store(0, Ordering::SeqCst);
+    sig_init();
+    *(&raw mut crate::__sig_last_restart) = false;
+}
+
 /// Install a signal handler for signal `sig`.
 ///
 /// `handler` is one of: `SIG_DFL` (default), `SIG_IGN` (ignore), or a

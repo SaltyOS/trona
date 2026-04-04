@@ -4,22 +4,33 @@
 //! pthread_detach, and pthread_cancel on top of SaltyOS kernel primitives
 //! (TCB, SchedContext, futex, TLS).
 //!
+//! ## Architecture
+//!
+//! Thread lifecycle is split between the substrate and the POSIX personality:
+//!
+//! - **Substrate** (`trona::tls`): owns the `ThreadDesc` pool (64 slots),
+//!   thread IDs, TLS blocks, caps, stack/IPC mappings. Personality-neutral.
+//! - **POSIX** (this file): owns `PosixThreadExt` — join/detach state,
+//!   exit values. Linked to the substrate desc via `desc.personality_data`.
+//!
 //! ## Handle lifetime safety
 //!
 //! `pthread_t` is an opaque u64 encoding a pool index and generation counter
 //! (not a raw pointer). The generation counter is incremented each time a pool
 //! slot is recycled, preventing ABA issues where a stale handle could
 //! reference a different thread. All API functions validate the generation
-//! before accessing the pool slot.
+//! and owner before accessing the pool slot.
 //!
 //! ## State machine
 //!
+//! Substrate state (ThreadDesc.state):
 //! ```text
-//! UNUSED ──create──► RUNNING ──exit(joinable)──► EXITED ──join──► JOINED ──cleanup──► UNUSED
-//!                       │                          │
-//!                       ├──detach──► DETACHED      └──detach──► cleanup ──► UNUSED
-//!                       │               │
-//!                       │               └──exit──► DETACHED_EXITED ──reap──► UNUSED
+//! TD_UNUSED ──alloc──► TD_RUNNING ──exit──► TD_EXITED ──reap──► TD_REAPING ──cleanup──► TD_UNUSED
+//! ```
+//!
+//! POSIX overlay (PosixThreadExt.detached):
+//! ```text
+//! joinable (false) → pthread_detach → detached (true)
 //! ```
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
@@ -32,20 +43,14 @@ use trona::protocol::*;
 use trona::serial;
 use trona::slot_alloc;
 use trona::syscall::{futex_wait, futex_wake};
-use crate::tls::{self, ThreadLocalBlock};
+use trona::tls::{
+    self as substrate_tls, ThreadDesc, ThreadOwner,
+    TD_UNUSED, TD_RUNNING, TD_EXITED, TD_REAPING,
+    MAX_THREADS, thread_desc, alloc_thread_desc, next_thread_id, desc_from_tls,
+};
+use crate::tls::{self, ThreadLocalBlock, CleanupHandler};
 use trona::types::core::*;
 use ::core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-
-/// Maximum concurrent threads per process (slot 0 = main thread)
-const MAX_THREADS: usize = 64;
-
-/// ThreadControl state constants
-const TC_UNUSED: u32 = 0;
-const TC_RUNNING: u32 = 1;
-const TC_EXITED: u32 = 2;
-const TC_JOINED: u32 = 3;
-const TC_DETACHED: u32 = 4;
-const TC_DETACHED_EXITED: u32 = 5;
 
 /// Default thread stack size: 2 MiB
 const DEFAULT_STACK_SIZE: u64 = 2 * 1024 * 1024;
@@ -97,67 +102,34 @@ impl PthreadAttr {
 }
 
 // ---------------------------------------------------------------------------
-// ThreadControl: per-thread lifecycle state, lives in a global pool
+// PosixThreadExt: POSIX-specific per-thread state (join/detach/exit)
 // ---------------------------------------------------------------------------
 
-/// Per-thread control block. Lives in a static pool, not on the thread's stack.
+/// POSIX-specific thread extension. Linked to the substrate `ThreadDesc`
+/// via `desc.personality_data`.
 ///
-/// Access is synchronized via CAS on `state`. Only the thread that successfully
-/// CASes a slot from UNUSED→RUNNING owns it; only the joiner that CASes
-/// EXITED→JOINED may clean it up.
-///
-/// Public so `PthreadT` can be used from external crates, but all fields
-/// are private — external code treats this as an opaque handle.
-#[repr(C)]
-pub struct ThreadControl {
-    /// Lifecycle state (TC_UNUSED / TC_RUNNING / TC_EXITED / TC_JOINED / TC_DETACHED / TC_DETACHED_EXITED)
-    state: AtomicU32,
-    /// Generation counter — incremented on each slot reuse to prevent ABA
-    generation: AtomicU32,
+/// Contains only the fields that are POSIX personality-specific and not
+/// shared with other personalities (Win32, Worker).
+pub struct PosixThreadExt {
     /// Futex word for pthread_join synchronization (0 = not exited, 1 = exited)
-    join_futex: AtomicU32,
+    pub join_futex: AtomicU32,
     /// Return value from pthread_exit (set by exiting thread, read by joiner)
-    exit_value: *mut u8,
-    /// Thread ID (unique per thread within a process)
-    thread_id: u64,
-    /// Base address of the thread's stack allocation
-    stack_base: u64,
-    /// Size of the thread's stack allocation (bytes)
-    stack_size: u64,
-    /// CNode slot of the thread's TCB capability
-    tcb_cap: u64,
-    /// CNode slot of the thread's SchedContext capability
-    sc_cap: u64,
-    /// CNode slot of the IPC buffer frame capability
-    frame_cap: u64,
-    /// Pointer to the thread's TLS block (on its stack)
-    tls_ptr: *mut ThreadLocalBlock,
-    /// IPC buffer virtual address (for cleanup via vspace_unmap)
-    ipc_buf_vaddr: u64,
+    pub exit_value: *mut u8,
+    /// Whether this thread has been detached (true = cannot be joined)
+    pub detached: bool,
 }
 
-// SAFETY: ThreadControl fields are accessed through raw pointers with
-// synchronization provided by atomic CAS on `state`. The raw pointer
-// fields (exit_value, tls_ptr) are only accessed by the owning thread
-// or after the state CAS establishes a happens-before relationship.
-unsafe impl Send for ThreadControl {}
-unsafe impl Sync for ThreadControl {}
+// SAFETY: PosixThreadExt fields are accessed through raw pointers with
+// synchronization provided by the substrate desc's atomic state CAS.
+unsafe impl Send for PosixThreadExt {}
+unsafe impl Sync for PosixThreadExt {}
 
-impl ThreadControl {
+impl PosixThreadExt {
     const fn zeroed() -> Self {
-        ThreadControl {
-            state: AtomicU32::new(TC_UNUSED),
-            generation: AtomicU32::new(0),
+        PosixThreadExt {
             join_futex: AtomicU32::new(0),
             exit_value: ::core::ptr::null_mut(),
-            thread_id: 0,
-            stack_base: 0,
-            stack_size: 0,
-            tcb_cap: 0,
-            sc_cap: 0,
-            frame_cap: 0,
-            tls_ptr: ::core::ptr::null_mut(),
-            ipc_buf_vaddr: 0,
+            detached: false,
         }
     }
 
@@ -167,38 +139,40 @@ impl ThreadControl {
     }
 }
 
-static mut THREAD_POOL: [ThreadControl; MAX_THREADS] =
-    [const { ThreadControl::zeroed() }; MAX_THREADS];
+static mut POSIX_EXT_POOL: [PosixThreadExt; MAX_THREADS] =
+    [const { PosixThreadExt::zeroed() }; MAX_THREADS];
 
-/// Get a raw pointer to pool slot `index`.
+/// Get a raw pointer to POSIX extension pool slot `index`.
 #[inline]
-fn pool_ptr(index: usize) -> *mut ThreadControl {
-    // SAFETY: THREAD_POOL is a static array; we access it via raw pointer
-    // (no intermediate reference) per Rust 2024 `static mut` rules.
+fn ext_ptr(index: usize) -> *mut PosixThreadExt {
     unsafe {
-        let base = &raw mut THREAD_POOL as *mut ThreadControl;
+        let base = &raw mut POSIX_EXT_POOL as *mut PosixThreadExt;
         base.add(index)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rollback helper
+// ---------------------------------------------------------------------------
+
 /// Rollback helper for pthread_create failures.
 ///
-/// Cleans up caps (if allocated), unmaps stack, and returns pool slot.
+/// Cleans up caps (if allocated), unmaps stack, and returns substrate desc slot.
 ///
 /// # Safety
-/// `tc` must be a valid pool slot pointer. `stack_addr`/`stack_size` must be
-/// a valid mmap region (or null/0 if not yet allocated).
+/// `desc` must be a valid substrate thread descriptor. `stack_addr`/`stack_size`
+/// must be a valid mmap region (or null/0 if not yet allocated).
 unsafe fn rollback_create(
-    tc: *mut ThreadControl,
+    desc: *mut ThreadDesc,
     stack_addr: *mut u8,
     stack_size: u64,
     caps_allocated: bool,
 ) {
     unsafe {
         if caps_allocated {
-            let tcb_cap = (*tc).tcb_cap;
-            let sc_cap = (*tc).sc_cap;
-            let frame_cap = (*tc).frame_cap;
+            let tcb_cap = (*desc).tcb_cap;
+            let sc_cap = (*desc).sc_cap;
+            let frame_cap = (*desc).ipc_frame_cap;
             if tcb_cap != 0 {
                 invoke::cnode_delete(CAP_SELF_CSPACE, tcb_cap);
             }
@@ -212,17 +186,20 @@ unsafe fn rollback_create(
         if !stack_addr.is_null() && stack_size != 0 {
             crate::mm::posix_munmap(stack_addr, stack_size);
         }
-        (*tc).state.store(TC_UNUSED, Ordering::Release);
+        (*desc).personality_data = ::core::ptr::null_mut();
+        (*desc).personality_cleanup = None;
+        (*desc).state.store(TD_UNUSED, Ordering::Release);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Constants and handle encoding
+// ---------------------------------------------------------------------------
 
 /// IPC buffer mapping region: each thread gets one 4K page for its IPC buffer.
 /// Start at a high address to avoid conflicts with mmap regions.
 const IPC_BUF_REGION_BASE: u64 = 0x0000_7F00_0000_0000;
 static IPC_BUF_NEXT: AtomicU64 = AtomicU64::new(IPC_BUF_REGION_BASE);
-
-/// Monotonic thread ID counter
-static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Well-known cap slots
 const CAP_SELF_TCB: u64 = 0;
@@ -255,39 +232,143 @@ fn decode_handle(handle: PthreadT) -> Option<(usize, u16)> {
     Some((index, generation))
 }
 
-/// Validate a handle against the current generation of its pool slot.
-/// Returns a raw pointer to the ThreadControl if the generation matches.
+/// Validate a handle: checks generation and that the desc is Personality-owned.
+/// Returns (desc pointer, pool index) if valid.
 ///
 /// # Safety
-/// The returned pointer is valid as long as the pool slot is not recycled
-/// (which can only happen after the caller finishes its operation).
-unsafe fn validate_handle(handle: PthreadT) -> Option<*mut ThreadControl> {
+/// The returned pointer is valid as long as the pool slot is not recycled.
+unsafe fn validate_handle(handle: PthreadT) -> Option<(*mut ThreadDesc, usize)> {
     let (index, expected_gen) = decode_handle(handle)?;
-    let tc = pool_ptr(index);
-    // SAFETY: tc points to a valid pool slot (index < MAX_THREADS)
-    let current_gen = unsafe { (*tc).generation.load(Ordering::Acquire) };
-    if (current_gen as u16) != expected_gen {
-        return None;
+    let desc = thread_desc(index);
+    unsafe {
+        let current_gen = (*desc).generation.load(Ordering::Acquire);
+        if (current_gen as u16) != expected_gen {
+            return None;
+        }
+        // Only POSIX personality threads are valid pthread targets
+        if (*desc).owner != ThreadOwner::Personality {
+            return None;
+        }
+        Some((desc, index))
     }
-    Some(tc)
 }
 
-/// Initialize the main thread's ThreadControl slot (pool index 0).
+// ---------------------------------------------------------------------------
+// Personality cleanup callback (registered on ThreadDesc)
+// ---------------------------------------------------------------------------
+
+/// POSIX personality cleanup: called by substrate's `cleanup_thread()`.
+/// Handles POSIX-specific resource teardown before substrate cleanup.
+unsafe fn posix_personality_cleanup(desc: *mut ThreadDesc) {
+    unsafe {
+        let tcb_cap = (*desc).tcb_cap;
+        let sc_cap = (*desc).sc_cap;
+        let frame_cap = (*desc).ipc_frame_cap;
+        let stack_base = (*desc).stack_base;
+        let stack_size = (*desc).stack_size;
+        let ipc_va = (*desc).ipc_buf_vaddr;
+
+        // Suspend the thread's TCB (should already be suspended)
+        if tcb_cap != 0 {
+            invoke::tcb_suspend_retry(tcb_cap, 4);
+        }
+
+        // Unmap IPC buffer page before deleting the frame cap
+        if ipc_va != 0 {
+            invoke::vspace_unmap(CAP_SELF_VSPACE, ipc_va);
+            (*desc).ipc_buf_vaddr = 0;
+        }
+
+        // Unmap and free the stack (this also destroys the TLS block)
+        if stack_base != 0 && stack_size != 0 {
+            crate::mm::posix_munmap(stack_base as *mut u8, stack_size);
+        }
+
+        // Delete caps (TCB, SchedContext, IPC buffer frame)
+        if tcb_cap != 0 {
+            invoke::cnode_delete(CAP_SELF_CSPACE, tcb_cap);
+        }
+        if sc_cap != 0 {
+            invoke::cnode_delete(CAP_SELF_CSPACE, sc_cap);
+        }
+        if frame_cap != 0 {
+            invoke::cnode_delete(CAP_SELF_CSPACE, frame_cap);
+        }
+
+        // Clear POSIX extension
+        (*desc).personality_data = ::core::ptr::null_mut();
+    }
+}
+
+/// POSIX personality fork-child reinit: called by substrate's `_trona_post_fork_child()`.
+/// Re-initializes the POSIX extension pool for the child (only main thread survives).
+unsafe fn posix_personality_fork_child(desc: *mut ThreadDesc) {
+    unsafe {
+        // Reset main thread's POSIX ext
+        let ext = ext_ptr(0);
+        (*ext).join_futex.store(0, Ordering::Relaxed);
+        (*ext).exit_value = ::core::ptr::null_mut();
+        (*ext).detached = false;
+        (*desc).personality_data = ext as *mut u8;
+
+        // Clear non-main POSIX ext slots
+        for i in 1..MAX_THREADS {
+            let e = ext_ptr(i);
+            (*e).join_futex.store(0, Ordering::Relaxed);
+            (*e).exit_value = ::core::ptr::null_mut();
+            (*e).detached = false;
+        }
+
+        // Reset free hint
+        NEXT_FREE_HINT.store(1, Ordering::Relaxed);
+
+        crate::signals::sig_reinit_after_fork();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main thread initialization
+// ---------------------------------------------------------------------------
+
+/// Initialize the main thread's POSIX personality state.
 ///
-/// Called from `tls::init_main_thread_tls()` during process startup.
+/// Called from `tls::init_main_thread_tls()` after substrate TLS init.
+/// Sets up the POSIX extension for slot 0 and registers personality
+/// callbacks on the main thread's substrate descriptor.
 ///
 /// # Safety
 /// Must be called exactly once, after the main thread's TLS block is set up.
 pub unsafe fn init_main_thread_control(tls: *mut ThreadLocalBlock) {
     unsafe {
-        let tc = pool_ptr(0);
-        (*tc).state.store(TC_RUNNING, Ordering::Relaxed);
-        (*tc).thread_id = 0;
-        (*tc).tcb_cap = 0; // CAP_SELF_TCB
-        (*tc).tls_ptr = tls;
-        (*tls).control = tc as *mut u8;
+        let desc = desc_from_tls(tls);
+        if desc.is_null() {
+            return;
+        }
+
+        // Initialize POSIX extension for main thread (slot 0)
+        let ext = ext_ptr(0);
+        (*ext).join_futex.store(0, Ordering::Relaxed);
+        (*ext).exit_value = ::core::ptr::null_mut();
+        (*ext).detached = false;
+
+        // Link desc ↔ POSIX ext
+        (*desc).owner = ThreadOwner::Personality;
+        (*desc).personality_data = ext as *mut u8;
+        (*desc).personality_cleanup = Some(posix_personality_cleanup);
+        (*desc).personality_fork_child = Some(posix_personality_fork_child);
     }
 }
+
+/// Compute the substrate pool index for a descriptor pointer.
+fn desc_pool_index(desc: *mut ThreadDesc) -> Option<usize> {
+    let base = thread_desc(0);
+    let offset = unsafe { desc.offset_from(base) } as usize;
+    if offset < MAX_THREADS { Some(offset) } else { None }
+}
+
+// ---------------------------------------------------------------------------
+// Thread creation
+// ---------------------------------------------------------------------------
 
 /// Create a new thread.
 ///
@@ -305,15 +386,15 @@ pub unsafe fn pthread_create(
     arg: *mut u8,
 ) -> i32 {
     unsafe {
-        // 1. Find a free slot in the thread pool (slot 0 is main thread).
+        // 1. Find a free slot in the substrate thread pool (slot 0 is main thread).
         // Start from NEXT_FREE_HINT to avoid O(N) scan when slots are dense.
         let hint = NEXT_FREE_HINT.load(Ordering::Relaxed);
         let mut slot_index = usize::MAX;
         for offset in 0..(MAX_THREADS - 1) {
             let i = ((hint - 1 + offset) % (MAX_THREADS - 1)) + 1;
-            let tc = pool_ptr(i);
-            if (*tc).state.compare_exchange(
-                TC_UNUSED, TC_RUNNING,
+            let desc = thread_desc(i);
+            if (*desc).state.compare_exchange(
+                TD_UNUSED, TD_RUNNING,
                 Ordering::AcqRel, Ordering::Relaxed,
             ).is_ok() {
                 slot_index = i;
@@ -325,9 +406,9 @@ pub unsafe fn pthread_create(
             // Pool full — reap detached-exited zombies and retry once.
             reap_detached_zombies();
             for i in 1..MAX_THREADS {
-                let tc = pool_ptr(i);
-                if (*tc).state.compare_exchange(
-                    TC_UNUSED, TC_RUNNING,
+                let desc = thread_desc(i);
+                if (*desc).state.compare_exchange(
+                    TD_UNUSED, TD_RUNNING,
                     Ordering::AcqRel, Ordering::Relaxed,
                 ).is_ok() {
                     slot_index = i;
@@ -338,17 +419,31 @@ pub unsafe fn pthread_create(
         }
         if slot_index == usize::MAX {
             serial::serial_puts(b"[PTHREAD] thread pool exhausted\n");
-            return -1;
+            return -11; // EAGAIN
         }
-        let tc = pool_ptr(slot_index);
+        let desc = thread_desc(slot_index);
 
-        // 2. Determine stack size and detach state from attributes
+        // 2. Initialize POSIX extension
+        let ext = ext_ptr(slot_index);
+        (*ext).join_futex.store(0, Ordering::Relaxed);
+        (*ext).exit_value = ::core::ptr::null_mut();
+
+        // Determine detach state from attributes
+        let detach_state = if !attr.is_null() { (*attr).detach_state } else { 0 };
+        (*ext).detached = detach_state == 1;
+
+        // Link desc → personality
+        (*desc).owner = ThreadOwner::Personality;
+        (*desc).personality_data = ext as *mut u8;
+        (*desc).personality_cleanup = Some(posix_personality_cleanup);
+        (*desc).personality_fork_child = None; // only main thread has fork callback
+
+        // 3. Determine stack size
         let stack_size = if !attr.is_null() && (*attr).stack_size != 0 {
             ((*attr).stack_size + 4095) & !4095
         } else {
             DEFAULT_STACK_SIZE
         };
-        let detach_state = if !attr.is_null() { (*attr).detach_state } else { 0 };
 
         // Map stack pages via mmsrv mmap
         let stack_addr = crate::mm::posix_mmap(
@@ -361,25 +456,19 @@ pub unsafe fn pthread_create(
         );
         if stack_addr == usize::MAX as *mut u8 || stack_addr.is_null() {
             serial::serial_puts(b"[PTHREAD] stack mmap failed\n");
-            (*tc).state.store(TC_UNUSED, Ordering::Release);
-            return -1;
+            (*desc).personality_data = ::core::ptr::null_mut();
+            (*desc).state.store(TD_UNUSED, Ordering::Release);
+            return -12; // ENOMEM
         }
         let stack_base = stack_addr as u64;
 
-        // 3. Fill ThreadControl fields
-        let tid = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
-        (*tc).thread_id = tid;
-        (*tc).stack_base = stack_base;
-        (*tc).stack_size = stack_size;
-        (*tc).join_futex.store(0, Ordering::Relaxed);
-        (*tc).exit_value = ::core::ptr::null_mut();
+        // 4. Fill descriptor fields
+        let tid = next_thread_id();
+        (*desc).thread_id = tid;
+        (*desc).stack_base = stack_base;
+        (*desc).stack_size = stack_size;
 
-        // If initially detached, update state
-        if detach_state == 1 {
-            (*tc).state.store(TC_DETACHED, Ordering::Release);
-        }
-
-        // 4. Place the per-thread TLS block at the top of the stack.
+        // 5. Place the per-thread TLS block at the top of the stack.
         let stack_top = stack_base + stack_size;
         let tls_memsz = tls::static_tls_total_memsz();
         let tls_align = ::core::cmp::max(tls::static_tls_align(), 16);
@@ -430,32 +519,33 @@ pub unsafe fn pthread_create(
         tls::install_runtime_tcb_anchor(tp, tls);
         (*tls).self_ptr = tls;
         (*tls).thread_id = tid;
-        (*tls).control = tc as *mut u8; // back-pointer to ThreadControl
+        (*tls).desc = desc as *mut u8; // back-pointer to substrate ThreadDesc
 
-        (*tc).tls_ptr = tls;
+        (*desc).tls_ptr = tls;
 
         // Effective stack pointer (below the entire TLS block, 16-byte aligned)
         let user_rsp = tls_block_base & !0xF;
 
-        // 5. Allocate 3 consecutive CNode slots for TCB, SchedContext, IPC buffer frame
+        // 6. Allocate 3 consecutive CNode slots for TCB, SchedContext, IPC buffer frame
         let base_slot = match slot_alloc::slot_alloc_consecutive(3) {
             Some(s) => s,
             None => {
                 serial::serial_puts(b"[PTHREAD] slot_alloc_consecutive(3) failed\n");
                 crate::mm::posix_munmap(stack_addr, stack_size);
-                (*tc).state.store(TC_UNUSED, Ordering::Release);
-                return -1;
+                (*desc).personality_data = ::core::ptr::null_mut();
+                (*desc).state.store(TD_UNUSED, Ordering::Release);
+                return -12; // ENOMEM
             }
         };
         let tcb_slot = base_slot;
         let sc_slot = base_slot + 1;
         let frame_slot = base_slot + 2;
 
-        (*tc).tcb_cap = tcb_slot;
-        (*tc).sc_cap = sc_slot;
-        (*tc).frame_cap = frame_slot;
+        (*desc).tcb_cap = tcb_slot;
+        (*desc).sc_cap = sc_slot;
+        (*desc).ipc_frame_cap = frame_slot;
 
-        // 6. Request object allocation from mmsrv
+        // 7. Request object allocation from mmsrv
         ipc::set_receive_slot_ctx(
             tls::current_ipc_ctx(),
             CAP_SELF_CSPACE,
@@ -481,29 +571,39 @@ pub unsafe fn pthread_create(
                 _lb.hex(reply.label);
                 _lb.str(b"\n");
             });
-            rollback_create(tc, stack_addr, stack_size, false);
-            return -1;
+            rollback_create(desc, stack_addr, stack_size, false);
+            return -12; // ENOMEM
         }
 
-        // 7. Configure TCB: share CSpace and VSpace with parent
-        let err = invoke::tcb_set_space(tcb_slot, CAP_SELF_CSPACE, CAP_SELF_VSPACE);
+        // 8. Configure TCB: share CSpace and VSpace with parent.
+        // Prefer the authoritative kernel-reported depth; fall back to the
+        // allocator's observed value only if the query path is unavailable.
+        let depth = invoke::tcb_get_space_info(CAP_SELF_TCB)
+            .unwrap_or_else(trona::slot_alloc::observed_cspace_depth);
+        let err = if depth > 0 {
+            invoke::tcb_set_space_with_depth(
+                tcb_slot, CAP_SELF_CSPACE, CAP_SELF_VSPACE, depth as u64,
+            )
+        } else {
+            invoke::tcb_set_space(tcb_slot, CAP_SELF_CSPACE, CAP_SELF_VSPACE)
+        };
         if err != 0 {
             serial::serial_puts(b"[PTHREAD] tcb_set_space failed\n");
-            rollback_create(tc, stack_addr, stack_size, true);
-            return -1;
+            rollback_create(desc, stack_addr, stack_size, true);
+            return -12; // ENOMEM
         }
 
-        // 7b. Set fault handler: route VMFaults to mmsrv (same badged EP as parent)
+        // 8b. Set fault handler: route VMFaults to mmsrv (same badged EP as parent)
         let err = invoke::tcb_set_fault_handler(tcb_slot, CAP_MMSRV_EP);
         if err != 0 {
             serial::serial_puts(b"[PTHREAD] tcb_set_fault_handler failed\n");
-            rollback_create(tc, stack_addr, stack_size, true);
-            return -1;
+            rollback_create(desc, stack_addr, stack_size, true);
+            return -12; // ENOMEM
         }
 
-        // 8. Map IPC buffer frame
+        // 9. Map IPC buffer frame
         let ipc_buf_vaddr = IPC_BUF_NEXT.fetch_add(4096, Ordering::Relaxed);
-        (*tc).ipc_buf_vaddr = ipc_buf_vaddr;
+        (*desc).ipc_buf_vaddr = ipc_buf_vaddr;
         let err = invoke::vspace_map(
             CAP_SELF_VSPACE,
             frame_slot,
@@ -512,29 +612,29 @@ pub unsafe fn pthread_create(
         );
         if err != 0 {
             serial::serial_puts(b"[PTHREAD] IPC buffer map failed\n");
-            rollback_create(tc, stack_addr, stack_size, true);
-            return -1;
+            rollback_create(desc, stack_addr, stack_size, true);
+            return -12; // ENOMEM
         }
 
         let err = invoke::tcb_set_ipc_buffer(tcb_slot, ipc_buf_vaddr);
         if err != 0 {
             serial::serial_puts(b"[PTHREAD] tcb_set_ipc_buffer failed\n");
-            rollback_create(tc, stack_addr, stack_size, true);
-            return -1;
+            rollback_create(desc, stack_addr, stack_size, true);
+            return -12; // ENOMEM
         }
 
         (*tls).ipc_ctx.ipc_buffer = ipc_buf_vaddr as *mut IpcBuffer;
         (*tls).ipc_ctx.send_cap_count = 0;
 
-        // 9. Set the architecture thread pointer for the new thread.
+        // 10. Set the architecture thread pointer for the new thread.
         let err = invoke::tcb_set_tls_base(tcb_slot, tp);
         if err != 0 {
             serial::serial_puts(b"[PTHREAD] tcb_set_tls_base failed\n");
-            rollback_create(tc, stack_addr, stack_size, true);
-            return -1;
+            rollback_create(desc, stack_addr, stack_size, true);
+            return -12; // ENOMEM
         }
 
-        // 10. Configure entry point: trampoline pops start_fn and arg from stack
+        // 11. Configure entry point: trampoline pops start_fn and arg from stack
         let trampoline_rsp = user_rsp - 8;
         let fake_ret = trampoline_rsp as *mut u64;
         *fake_ret = 0; // No return address — trampoline calls pthread_exit
@@ -551,36 +651,36 @@ pub unsafe fn pthread_create(
         );
         if err != 0 {
             serial::serial_puts(b"[PTHREAD] tcb_configure failed\n");
-            rollback_create(tc, stack_addr, stack_size, true);
-            return -1;
+            rollback_create(desc, stack_addr, stack_size, true);
+            return -12; // ENOMEM
         }
 
-        // 11. Configure scheduling context
+        // 12. Configure scheduling context
         let err = invoke::sc_configure(sc_slot, 10000, 100000);
         if err != 0 {
             serial::serial_puts(b"[PTHREAD] sc_configure failed\n");
-            rollback_create(tc, stack_addr, stack_size, true);
-            return -1;
+            rollback_create(desc, stack_addr, stack_size, true);
+            return -12; // ENOMEM
         }
 
         let err = invoke::sc_bind(sc_slot, tcb_slot);
         if err != 0 {
             serial::serial_puts(b"[PTHREAD] sc_bind failed\n");
-            rollback_create(tc, stack_addr, stack_size, true);
-            return -1;
+            rollback_create(desc, stack_addr, stack_size, true);
+            return -12; // ENOMEM
         }
 
-        // 12. Resume the thread
+        // 13. Resume the thread
         let err = invoke::tcb_resume(tcb_slot);
         if err != 0 {
             serial::serial_puts(b"[PTHREAD] tcb_resume failed\n");
-            rollback_create(tc, stack_addr, stack_size, true);
-            return -1;
+            rollback_create(desc, stack_addr, stack_size, true);
+            return -12; // ENOMEM
         }
 
         // Return ABA-safe thread handle
         if !thread_out.is_null() {
-            let cur_gen = (*tc).generation.load(Ordering::Relaxed);
+            let cur_gen = (*desc).generation.load(Ordering::Relaxed);
             *thread_out = encode_handle(slot_index, cur_gen);
         }
 
@@ -623,36 +723,58 @@ unsafe extern "C" fn pthread_trampoline_helper(
 
 /// Terminate the calling thread and store the return value.
 ///
-/// If the thread is joinable (RUNNING), transitions to EXITED and wakes
-/// any joiner. If detached, transitions to DETACHED_EXITED for deferred
-/// cleanup by another live thread.
+/// For Personality-owned threads: transitions to TD_EXITED, wakes joiner.
+/// For Worker-owned threads: transitions to TD_EXITED only (no join support).
 pub unsafe fn pthread_exit(retval: *mut u8) -> ! {
     unsafe {
         let self_tcb;
 
         if let Some(tls) = tls::current_tls() {
-            let tc = (*tls).control as *mut ThreadControl;
-            if !tc.is_null() {
+            let desc = desc_from_tls(tls);
+            if !desc.is_null() {
                 // Read tcb_cap before any state transition — a joiner on another
                 // CPU could clean up the slot as soon as we set EXITED.
-                self_tcb = (*tc).tcb_cap;
+                self_tcb = (*desc).tcb_cap;
 
-                // Store exit value (visible to joiner after state CAS Release)
-                (*tc).exit_value = retval;
+                match (*desc).owner {
+                    ThreadOwner::Personality => {
+                        // POSIX personality: store exit value, wake joiner
+                        let ext = (*desc).personality_data as *mut PosixThreadExt;
+                        if !ext.is_null() {
+                            (*ext).exit_value = retval;
+                        }
 
-                // Try joinable path: RUNNING → EXITED
-                if (*tc).state.compare_exchange(
-                    TC_RUNNING, TC_EXITED,
-                    Ordering::Release, Ordering::Relaxed,
-                ).is_ok() {
-                    (*tc).join_futex.store(1, Ordering::Release);
-                    futex_wake((*tc).join_futex_ptr(), 1);
-                } else {
-                    // Must be DETACHED — mark for deferred cleanup by reaper.
-                    let _ = (*tc).state.compare_exchange(
-                        TC_DETACHED, TC_DETACHED_EXITED,
-                        Ordering::Release, Ordering::Relaxed,
-                    );
+                        // Transition: TD_RUNNING → TD_EXITED
+                        let _ = (*desc).state.compare_exchange(
+                            TD_RUNNING, TD_EXITED,
+                            Ordering::Release, Ordering::Relaxed,
+                        );
+
+                        // Wake joiner (or detach reaper)
+                        if !ext.is_null() {
+                            (*ext).join_futex.store(1, Ordering::Release);
+                            futex_wake((*ext).join_futex_ptr(), 1);
+                        }
+                    }
+                    ThreadOwner::Worker => {
+                        // Worker #0 (main thread as worker): process must terminate.
+                        // It is the reaper anchor — no live thread remains if it exits.
+                        if (*desc).thread_id == 0 {
+                            unsafe { crate::proc::posix_exit(1); }
+                        }
+                        // Non-main worker: mark exited, substrate reaper handles cleanup.
+                        let _ = (*desc).state.compare_exchange(
+                            TD_RUNNING, TD_EXITED,
+                            Ordering::Release, Ordering::Relaxed,
+                        );
+                    }
+                    ThreadOwner::Main => {
+                        // Main thread exit: process should terminate
+                        let _ = (*desc).state.compare_exchange(
+                            TD_RUNNING, TD_EXITED,
+                            Ordering::Release, Ordering::Relaxed,
+                        );
+                    }
                 }
             } else {
                 self_tcb = CAP_SELF_TCB;
@@ -672,67 +794,46 @@ pub unsafe fn pthread_exit(retval: *mut u8) -> ! {
     }
 }
 
-/// Clean up a thread's resources: suspend TCB, unmap stack, delete caps.
+/// Clean up a POSIX thread's resources via substrate cleanup.
+///
+/// This calls the substrate's `cleanup_thread()` which invokes our
+/// `posix_personality_cleanup` callback, then reclaims the desc slot.
 ///
 /// # Safety
-/// Caller must own the ThreadControl slot (via successful CAS to JOINED).
-unsafe fn cleanup_thread(tc: *mut ThreadControl) {
+/// Caller must have successfully CAS'd the desc state to TD_REAPING.
+unsafe fn cleanup_thread(desc: *mut ThreadDesc) {
     unsafe {
-        let tcb_cap = (*tc).tcb_cap;
-        let sc_cap = (*tc).sc_cap;
-        let frame_cap = (*tc).frame_cap;
-        let stack_base = (*tc).stack_base;
-        let stack_size = (*tc).stack_size;
-        let ipc_va = (*tc).ipc_buf_vaddr;
-
-        // Suspend the thread's TCB (should already be suspended)
-        if tcb_cap != 0 {
-            invoke::tcb_suspend_retry(tcb_cap, 4);
-        }
-
-        // Unmap IPC buffer page before deleting the frame cap
-        if ipc_va != 0 {
-            invoke::vspace_unmap(CAP_SELF_VSPACE, ipc_va);
-            (*tc).ipc_buf_vaddr = 0;
-        }
-
-        // Unmap and free the stack (this also destroys the TLS block)
-        if stack_base != 0 && stack_size != 0 {
-            crate::mm::posix_munmap(stack_base as *mut u8, stack_size);
-        }
-
-        // Delete caps (TCB, SchedContext, IPC buffer frame)
-        if tcb_cap != 0 {
-            invoke::cnode_delete(CAP_SELF_CSPACE, tcb_cap);
-        }
-        if sc_cap != 0 {
-            invoke::cnode_delete(CAP_SELF_CSPACE, sc_cap);
-        }
-        if frame_cap != 0 {
-            invoke::cnode_delete(CAP_SELF_CSPACE, frame_cap);
-        }
-
-        // Increment generation to invalidate stale handles (ABA prevention)
-        (*tc).generation.fetch_add(1, Ordering::Release);
-        // Return slot to pool
-        (*tc).state.store(TC_UNUSED, Ordering::Release);
+        substrate_tls::cleanup_thread(desc);
     }
 }
 
 /// Reclaim detached threads that have already exited.
 ///
 /// Detached threads cannot reclaim their own stacks while running on them.
-/// We mark them `TC_DETACHED_EXITED` in `pthread_exit` and clean them up from
+/// We check `state==TD_EXITED && ext.detached` and clean them up from
 /// another live thread at pthread API entry points.
 unsafe fn reap_detached_zombies() {
     unsafe {
         for i in 1..MAX_THREADS {
-            let tc = pool_ptr(i);
-            if (*tc).state.compare_exchange(
-                TC_DETACHED_EXITED, TC_JOINED,
+            let desc = thread_desc(i);
+            let state = (*desc).state.load(Ordering::Acquire);
+            if state != TD_EXITED {
+                continue;
+            }
+            // Only reap if it's a POSIX Personality thread that was detached
+            if (*desc).owner != ThreadOwner::Personality {
+                continue;
+            }
+            let ext = (*desc).personality_data as *mut PosixThreadExt;
+            if ext.is_null() || !(*ext).detached {
+                continue;
+            }
+            // CAS TD_EXITED → TD_REAPING to claim for cleanup
+            if (*desc).state.compare_exchange(
+                TD_EXITED, TD_REAPING,
                 Ordering::AcqRel, Ordering::Relaxed,
             ).is_ok() {
-                cleanup_thread(tc);
+                cleanup_thread(desc);
             }
         }
     }
@@ -746,23 +847,15 @@ unsafe fn reap_detached_zombies() {
 pub unsafe fn process_exit_reap() {
     unsafe {
         for i in 1..MAX_THREADS {
-            let tc = pool_ptr(i);
-
-            // Detached thread that already exited and is awaiting reaper
-            if (*tc).state.compare_exchange(
-                TC_DETACHED_EXITED, TC_JOINED,
-                Ordering::AcqRel, Ordering::Relaxed,
-            ).is_ok() {
-                cleanup_thread(tc);
-                continue;
-            }
-
-            // Joinable thread that exited but was never joined
-            if (*tc).state.compare_exchange(
-                TC_EXITED, TC_JOINED,
-                Ordering::AcqRel, Ordering::Relaxed,
-            ).is_ok() {
-                cleanup_thread(tc);
+            let desc = thread_desc(i);
+            let state = (*desc).state.load(Ordering::Acquire);
+            if state == TD_EXITED {
+                if (*desc).state.compare_exchange(
+                    TD_EXITED, TD_REAPING,
+                    Ordering::AcqRel, Ordering::Relaxed,
+                ).is_ok() {
+                    cleanup_thread(desc);
+                }
             }
         }
     }
@@ -774,12 +867,11 @@ pub unsafe fn process_exit_reap() {
 /// returned from its start function. On success, `*retval` (if non-null)
 /// is set to the thread's exit value.
 ///
-/// Returns 0 on success, -1 on error (null handle, self-join, detached,
-/// or already joined).
+/// Returns 0 on success, negative errno on error.
 pub unsafe fn pthread_join(thread: PthreadT, retval: *mut *mut u8) -> i32 {
-    let tc = match unsafe { validate_handle(thread) } {
-        Some(tc) => tc,
-        None => return -1,
+    let (desc, index) = match unsafe { validate_handle(thread) } {
+        Some(v) => v,
+        None => return -3, // ESRCH — thread not found or not a Personality thread
     };
 
     unsafe {
@@ -788,43 +880,53 @@ pub unsafe fn pthread_join(thread: PthreadT, retval: *mut *mut u8) -> i32 {
 
         // Self-join check: deadlock prevention
         if pthread_self() == thread {
-            return -1; // EDEADLK
+            return -35; // EDEADLK
+        }
+
+        let ext = (*desc).personality_data as *mut PosixThreadExt;
+        if ext.is_null() {
+            return -22; // EINVAL
+        }
+
+        // Cannot join a detached thread
+        if (*ext).detached {
+            return -22; // EINVAL
         }
 
         // Wait for the thread to exit
         loop {
-            let state = (*tc).state.load(Ordering::Acquire);
-            if state == TC_EXITED {
+            let state = (*desc).state.load(Ordering::Acquire);
+            if state == TD_EXITED {
                 break;
             }
-            if state != TC_RUNNING {
-                // Thread is detached, unused, or already joined
-                return -1;
+            if state != TD_RUNNING {
+                // Thread is unused, reaping, or otherwise not joinable
+                return -22; // EINVAL
             }
 
             // Block on the futex until the exiting thread sets join_futex=1
-            let fval = (*tc).join_futex.load(Ordering::Acquire);
+            let fval = (*ext).join_futex.load(Ordering::Acquire);
             if fval == 0 {
-                futex_wait((*tc).join_futex_ptr(), 0);
+                futex_wait((*ext).join_futex_ptr(), 0);
             }
         }
 
-        // Claim the right to join: CAS EXITED → JOINED
-        if (*tc).state.compare_exchange(
-            TC_EXITED, TC_JOINED,
+        // Claim the right to reap: CAS TD_EXITED → TD_REAPING
+        if (*desc).state.compare_exchange(
+            TD_EXITED, TD_REAPING,
             Ordering::AcqRel, Ordering::Relaxed,
         ).is_err() {
             // Another thread already joined or detached
-            return -1;
+            return -22; // EINVAL
         }
 
         // Read exit value (safe: CAS Release/Acquire provides happens-before)
         if !retval.is_null() {
-            *retval = (*tc).exit_value;
+            *retval = (*ext).exit_value;
         }
 
-        // Cleanup: suspend TCB, munmap stack, delete caps, return slot
-        cleanup_thread(tc);
+        // Cleanup: personality + substrate resource teardown
+        cleanup_thread(desc);
 
         0
     }
@@ -836,18 +938,17 @@ pub unsafe fn pthread_join(thread: PthreadT, retval: *mut *mut u8) -> i32 {
 pub fn pthread_self() -> PthreadT {
     match tls::current_tls() {
         Some(tls) => unsafe {
-            let tc = (*tls).control as *mut ThreadControl;
-            if tc.is_null() {
+            let desc = desc_from_tls(tls);
+            if desc.is_null() {
                 return PTHREAD_NULL;
             }
-            // Compute pool index from pointer offset
-            let base = &raw mut THREAD_POOL as *mut ThreadControl;
-            let index = tc.offset_from(base) as usize;
-            if index >= MAX_THREADS {
-                return PTHREAD_NULL;
+            match desc_pool_index(desc) {
+                Some(index) => {
+                    let cur_gen = (*desc).generation.load(Ordering::Relaxed);
+                    encode_handle(index, cur_gen)
+                }
+                None => PTHREAD_NULL,
             }
-            let cur_gen = (*tc).generation.load(Ordering::Relaxed);
-            encode_handle(index, cur_gen)
         },
         None => PTHREAD_NULL,
     }
@@ -861,25 +962,24 @@ pub const PTHREAD_CANCELED: *mut u8 = usize::MAX as *mut u8;
 /// Sets the `cancel_pending` flag on the target thread's TLS. The thread
 /// will be cancelled at the next cancellation point (if deferred mode).
 ///
-/// Returns 0 on success, -1 if the thread is not alive.
+/// Returns 0 on success, negative errno if the thread is not alive.
 pub unsafe fn pthread_cancel(thread: PthreadT) -> i32 {
-    let tc = match unsafe { validate_handle(thread) } {
-        Some(tc) => tc,
-        None => return -1,
+    let (desc, _index) = match unsafe { validate_handle(thread) } {
+        Some(v) => v,
+        None => return -3, // ESRCH
     };
     unsafe {
-        let state = (*tc).state.load(Ordering::Acquire);
-        if state != TC_RUNNING && state != TC_DETACHED {
-            return -1;
+        let state = (*desc).state.load(Ordering::Acquire);
+        if state != TD_RUNNING {
+            return -3; // ESRCH
         }
-        let tls = (*tc).tls_ptr;
+        let tls = (*desc).tls_ptr;
         if tls.is_null() {
-            return -1;
+            return -3; // ESRCH
         }
         // Set cancellation flag
         ::core::ptr::write_volatile(&raw mut (*tls).cancel_pending, 1);
         // Wake thread if blocked on a cancellation-point futex.
-        // Spurious wake is safe — all cancellation points re-check their conditions.
         let futex_addr = (*tls).blocked_futex_addr.load(Ordering::Acquire);
         if futex_addr != 0 {
             futex_wake(futex_addr as *const u32, 1);
@@ -899,7 +999,7 @@ pub unsafe fn pthread_setcancelstate(state: i32, oldstate: *mut i32) -> i32 {
         }
         0
     } else {
-        -1
+        -22 // EINVAL
     }
 }
 
@@ -914,7 +1014,7 @@ pub unsafe fn pthread_setcanceltype(ctype: i32, oldtype: *mut i32) -> i32 {
         }
         0
     } else {
-        -1
+        -22 // EINVAL
     }
 }
 
@@ -938,7 +1038,7 @@ pub unsafe fn pthread_testcancel() {
 pub unsafe fn pthread_cleanup_push_impl(
     routine: unsafe extern "C" fn(*mut u8),
     arg: *mut u8,
-    handler: *mut tls::CleanupHandler,
+    handler: *mut CleanupHandler,
 ) {
     if let Some(tls) = tls::current_tls() {
         unsafe {
@@ -967,7 +1067,7 @@ pub unsafe fn pthread_cleanup_pop_impl(execute: i32) {
 }
 
 /// Run all cleanup handlers on the thread's cleanup stack (LIFO order).
-unsafe fn run_cleanup_handlers(tls: *mut tls::ThreadLocalBlock) {
+unsafe fn run_cleanup_handlers(tls: *mut ThreadLocalBlock) {
     unsafe {
         loop {
             let handler = (*tls).cleanup_stack;
@@ -982,50 +1082,53 @@ unsafe fn run_cleanup_handlers(tls: *mut tls::ThreadLocalBlock) {
 
 /// Mark a thread as detached (cannot be joined).
 ///
-/// If the thread is still running, transitions RUNNING → DETACHED.
+/// If the thread is still running, marks it as detached.
 /// If the thread already exited, performs immediate cleanup.
 ///
-/// Returns 0 on success, -1 on error.
+/// Returns 0 on success, negative errno on error.
 pub unsafe fn pthread_detach(thread: PthreadT) -> i32 {
-    let tc = match unsafe { validate_handle(thread) } {
-        Some(tc) => tc,
-        None => return -1,
+    let (desc, _index) = match unsafe { validate_handle(thread) } {
+        Some(v) => v,
+        None => return -3, // ESRCH — thread not found or not a Personality thread
     };
     unsafe {
         // Detach calls are also safe points for deferred cleanup.
         reap_detached_zombies();
 
-        // Try: thread is still running → mark as detached
-        if (*tc).state.compare_exchange(
-            TC_RUNNING, TC_DETACHED,
-            Ordering::AcqRel, Ordering::Relaxed,
-        ).is_ok() {
+        let ext = (*desc).personality_data as *mut PosixThreadExt;
+        if ext.is_null() {
+            return -22; // EINVAL
+        }
+
+        // Already detached
+        if (*ext).detached {
+            return -22; // EINVAL
+        }
+
+        let state = (*desc).state.load(Ordering::Acquire);
+
+        if state == TD_RUNNING {
+            // Thread is still running — mark as detached
+            (*ext).detached = true;
             // Wake any thread blocked in pthread_join's futex_wait loop.
-            // The joiner will re-check state, see TC_DETACHED, and return -1.
-            (*tc).join_futex.store(1, Ordering::Release);
-            futex_wake((*tc).join_futex_ptr(), 1);
+            (*ext).join_futex.store(1, Ordering::Release);
+            futex_wake((*ext).join_futex_ptr(), 1);
             return 0;
         }
 
-        // Try: thread already exited → claim and clean up immediately
-        if (*tc).state.compare_exchange(
-            TC_EXITED, TC_JOINED,
-            Ordering::AcqRel, Ordering::Relaxed,
-        ).is_ok() {
-            cleanup_thread(tc);
-            return 0;
+        if state == TD_EXITED {
+            // Thread already exited — claim and clean up immediately
+            (*ext).detached = true;
+            if (*desc).state.compare_exchange(
+                TD_EXITED, TD_REAPING,
+                Ordering::AcqRel, Ordering::Relaxed,
+            ).is_ok() {
+                cleanup_thread(desc);
+                return 0;
+            }
         }
 
-        // Try: detached thread already exited and is waiting for reaper
-        if (*tc).state.compare_exchange(
-            TC_DETACHED_EXITED, TC_JOINED,
-            Ordering::AcqRel, Ordering::Relaxed,
-        ).is_ok() {
-            cleanup_thread(tc);
-            return 0;
-        }
-
-        // Already detached, joined, or unused
-        -1
+        // Already reaping, unused, or otherwise not detachable
+        -22 // EINVAL
     }
 }

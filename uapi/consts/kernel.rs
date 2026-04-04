@@ -63,7 +63,7 @@ pub const UNTYPED_RETYPE: u64 = 0x20;
 pub const SC_CONFIGURE: u64 = 0x30;
 pub const SC_BIND: u64 = 0x31;
 
-/// TCB invoke labels (0x40-0x4E).
+/// TCB invoke labels (0x40-0x4F).
 pub const TCB_CONFIGURE: u64 = 0x40;
 pub const TCB_RESUME: u64 = 0x41;
 pub const TCB_SUSPEND: u64 = 0x42;
@@ -75,6 +75,7 @@ pub const TCB_SET_FAULT_HANDLER: u64 = 0x4B;
 pub const TCB_COPY_FPU: u64 = 0x4C;
 pub const TCB_SET_TLS_BASE: u64 = 0x4D;
 pub const TCB_SET_NOTIFICATION_DISPATCHER: u64 = 0x4E;
+pub const TCB_GET_SPACE_INFO: u64 = 0x4F;
 
 /// VSpace invoke labels (0x50-0x5F).
 pub const VSPACE_MAP: u64 = 0x50;
@@ -188,6 +189,8 @@ pub const AT_TRONA_SLOT_COUNT: u64 = 0x1008;
 pub const AT_TRONA_CSPACE_NTFN: u64 = 0x100A;
 pub const AT_TRONA_MM_EP: u64 = 0x100B;
 pub const AT_TRONA_IPC_BUFFER: u64 = 0x100C;
+/// SchedContext capability slot for the main thread.
+pub const AT_TRONA_SC_CAP: u64 = 0x100E;
 
 /// PE-specific auxv types (used by ld-trona-pe.so).
 pub const AT_SALTYOS_PE_BASE: u64 = 0x2000;

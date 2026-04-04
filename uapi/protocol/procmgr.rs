@@ -36,3 +36,4 @@ pub const PM_SETITIMER: u64 = 32;
 pub const PM_GETITIMER: u64 = 33;
 pub const PM_GET_EXE_PATH: u64 = 34;
 pub const PM_DUMP_PENDING: u64 = 35;
+pub const PM_GET_THREAD_CAPS: u64 = 36;

@@ -89,7 +89,13 @@ posix_fork:
     ret
 
 fork_child_entry:
-    /* Child starts here with SP pointing to saved state */
+    /* Child starts here with SP pointing to saved state.
+     * Call _trona_post_fork_child() BEFORE restoring registers so the
+     * substrate can reinitialise per-process state (IPC context, TLS
+     * fixups, slot allocator) in the freshly-forked child.
+     * Save area is at [SP, SP+608) (512 NEON + 96 GPR), call grows
+     * stack downward into free space — no conflict. */
+    bl      _trona_post_fork_child
 
     /* Restore ALL NEON/FP regs */
     ldp     q0,  q1,  [sp, #0]

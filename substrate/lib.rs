@@ -45,7 +45,9 @@ pub mod protocol;
 pub mod serial;
 pub mod slot_alloc;
 pub mod syscall;
+pub mod tls;
 pub mod types;
+pub mod worker;
 
 // Re-export for convenience
 pub use consts::*;
@@ -81,6 +83,12 @@ pub static mut __trona_slot_count: u64 = 0;
 #[unsafe(no_mangle)]
 #[linkage = "weak"]
 pub static mut __trona_cspace_ntfn: u64 = 0;
+
+/// SchedContext capability slot for the main thread
+/// (from `AT_TRONA_SC_CAP` auxv). 0 if not provided.
+#[unsafe(no_mangle)]
+#[linkage = "weak"]
+pub static mut __trona_sc_cap: u64 = 0;
 
 /// ELF TLS template address (runtime address of `.tdata` in the loaded binary).
 /// Set by rtld after processing PT_TLS.
@@ -118,14 +126,14 @@ pub static mut __trona_tls_modules: [StaticTlsModule; MAX_STATIC_TLS_MODULES] =
 // IPC context accessor (weak -- overridden by TLS-aware version in trona_posix)
 // ---------------------------------------------------------------------------
 
-/// Return a pointer to the current thread's IPC context.
+/// Return the current thread's IPC context.
 ///
-/// This weak default returns the global `__trona_ipc_ctx`. When the TLS
-/// subsystem is initialized (by `trona_posix::tls`), the TLS-aware override
-/// returns the per-thread IPC context from the thread-local block.
+/// If TLS is active (THREAD_LOCAL_ACTIVE is set), returns the per-thread
+/// IPC context from the thread-local block. Otherwise falls back to the
+/// global `__trona_ipc_ctx`.
 #[inline]
 pub fn current_ipc_ctx() -> *mut IpcContext {
-    &raw mut __trona_ipc_ctx
+    tls::current_ipc_ctx()
 }
 
 // ---------------------------------------------------------------------------

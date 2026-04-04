@@ -280,6 +280,129 @@ impl Timeval {
 // TLS metadata types (shared between substrate globals and posix::tls)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TLS block types (shared between substrate and personality layers)
+// ---------------------------------------------------------------------------
+
+/// Cleanup handler node for pthread_cleanup_push/pop.
+#[repr(C)]
+pub struct CleanupHandler {
+    pub routine: unsafe extern "C" fn(*mut u8),
+    pub arg: *mut u8,
+    pub next: *mut CleanupHandler,
+}
+
+unsafe impl Send for CleanupHandler {}
+unsafe impl Sync for CleanupHandler {}
+
+/// Per-thread local storage block.
+///
+/// Layout is `#[repr(C)]` for ABI stability. The `self_ptr` field MUST be
+/// first — the x86_64 TLS ABI mandates that `%fs:0` dereferences to the
+/// TLS block's own address.
+///
+/// This struct is the canonical ABI type shared by substrate, POSIX, Win32,
+/// and any future personality. Substrate sets `self_ptr`, `ipc_ctx`,
+/// `thread_id`. POSIX adds `errno`, `cancel_*`, `cleanup_stack`.
+/// The `desc` field is an opaque back-pointer to the substrate `ThreadDesc`;
+/// personalities cast through it to reach personality-specific extensions.
+#[repr(C)]
+pub struct ThreadLocalBlock {
+    /// Self-pointer: `%fs:0 == &self` (x86_64 TLS ABI requirement)
+    pub self_ptr: *mut ThreadLocalBlock,
+    /// Per-thread IPC context (IPC buffer pointer + send-cap count)
+    pub ipc_ctx: IpcContext,
+    /// Thread ID (unique per thread within a process)
+    pub thread_id: u64,
+    /// Per-thread errno value
+    pub errno: i32,
+    /// Padding for alignment
+    pub _pad0: i32,
+    /// Back-pointer to substrate ThreadDesc (opaque — cast in substrate only)
+    pub desc: *mut u8,
+    /// Cancellation state: 0=ENABLE, 1=DISABLE
+    pub cancel_state: u32,
+    /// Cancellation type: 0=DEFERRED (only type supported)
+    pub cancel_type: u32,
+    /// Set to 1 when cancellation has been requested
+    pub cancel_pending: u32,
+    pub _pad1: u32,
+    /// LIFO stack of cleanup handlers (intrusive linked list)
+    pub cleanup_stack: *mut CleanupHandler,
+    /// Futex address the thread is currently blocked on (for cancel wake).
+    /// Set before futex_wait at cancellation points, cleared after return.
+    /// 0 means the thread is not blocked on any cancellation-point futex.
+    pub blocked_futex_addr: core::sync::atomic::AtomicU64,
+
+    // ----- basaltc per-thread state (appended to preserve existing offsets) -----
+
+    /// Per-thread strtok() save pointer (used by basaltc strtok).
+    pub strtok_save: *mut u8,
+    /// Per-thread `struct tm` buffer for gmtime()/localtime() (56 bytes).
+    pub libc_tm_buf: [u8; 56],
+    /// Per-thread asctime() buffer (64 bytes).
+    pub libc_asctime_buf: [u8; 64],
+    /// Per-thread ctime() buffer (64 bytes).
+    pub libc_ctime_buf: [u8; 64],
+}
+
+unsafe impl Send for ThreadLocalBlock {}
+unsafe impl Sync for ThreadLocalBlock {}
+
+impl ThreadLocalBlock {
+    /// Create a zero-initialized TLS block with self_ptr set to null.
+    /// The caller must set `self_ptr = &mut self as *mut _` after placement.
+    pub const fn zeroed() -> Self {
+        ThreadLocalBlock {
+            self_ptr: core::ptr::null_mut(),
+            ipc_ctx: IpcContext::new(),
+            thread_id: 0,
+            errno: 0,
+            _pad0: 0,
+            desc: core::ptr::null_mut(),
+            cancel_state: 0,
+            cancel_type: 0,
+            cancel_pending: 0,
+            _pad1: 0,
+            cleanup_stack: core::ptr::null_mut(),
+            blocked_futex_addr: core::sync::atomic::AtomicU64::new(0),
+            strtok_save: core::ptr::null_mut(),
+            libc_tm_buf: [0; 56],
+            libc_asctime_buf: [0; 64],
+            libc_ctime_buf: [0; 64],
+        }
+    }
+}
+
+/// aarch64 ABI thread pointer block.
+/// `TPIDR_EL0` points to this structure. `runtime_tcb` points to the
+/// `ThreadLocalBlock` that follows the ELF TLS data region.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+pub struct AbiThreadPointerBlock {
+    pub runtime_tcb: *mut ThreadLocalBlock,
+    pub reserved: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe impl Send for AbiThreadPointerBlock {}
+#[cfg(target_arch = "aarch64")]
+unsafe impl Sync for AbiThreadPointerBlock {}
+
+#[cfg(target_arch = "aarch64")]
+impl AbiThreadPointerBlock {
+    pub const fn zeroed() -> Self {
+        AbiThreadPointerBlock {
+            runtime_tcb: core::ptr::null_mut(),
+            reserved: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TLS metadata types (shared between substrate globals and tls layer)
+// ---------------------------------------------------------------------------
+
 /// Maximum number of static TLS modules exported by rtld.
 pub const MAX_STATIC_TLS_MODULES: usize = 8;
 

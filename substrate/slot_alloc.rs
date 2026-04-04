@@ -254,6 +254,15 @@ pub fn slot_alloc_set_procmgr_ep(ep: Cap) {
     }
 }
 
+/// Return the observed CSpace depth after expansion (root_bits + sub_bits).
+///
+/// Returns 0 if no expansion has occurred (flat single-level CSpace).
+/// Used by the thread pool to configure child threads with the correct
+/// CSpace depth via `tcb_set_space_with_depth`.
+pub fn observed_cspace_depth() -> u8 {
+    unsafe { (*(&raw const SLOT_ALLOC)).expanded_depth }
+}
+
 /// Async slot allocation with self-healing NBSend expansion protocol.
 ///
 /// Returns `SlotResult::Ok(cap)` on success, `WouldBlock` if expansion is

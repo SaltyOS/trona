@@ -431,6 +431,7 @@ typedef struct {
 #define AT_TRONA_SLOT_BASE   0x1007
 #define AT_TRONA_SLOT_COUNT  0x1008
 #define AT_TRONA_CSPACE_NTFN 0x100A
+#define AT_TRONA_SC_CAP  0x100E
 
 /* ============================================================
  * CPIO parser (inline, self-contained)
@@ -602,6 +603,9 @@ struct rtld_state {
 
     /* CSpace expansion notification cap (from AT_TRONA_CSPACE_NTFN) */
     uint64_t cspace_ntfn;
+
+    /* SchedContext cap slot for the main thread (from AT_TRONA_SC_CAP) */
+    uint64_t sc_cap;
 
     /* Combined static TLS layout (exe + loaded PT_TLS DSOs) */
     uint64_t tls_memsz;

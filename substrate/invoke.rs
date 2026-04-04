@@ -125,6 +125,25 @@ pub fn tcb_set_notification_dispatcher(tcb: Cap, dispatcher: u64) -> i32 {
     invoke(tcb, TCB_SET_NOTIFICATION_DISPATCHER, dispatcher, 0, 0, 0).error as i32
 }
 
+/// Query the CSpace depth of a TCB.
+///
+/// The kernel writes cspace_depth to IPC buffer msg[0].
+/// Returns `Some(depth)` on success, `None` on error or missing IPC buffer.
+pub fn tcb_get_space_info(tcb: Cap) -> Option<u8> {
+    let r = invoke(tcb, TCB_GET_SPACE_INFO, 0, 0, 0, 0);
+    if r.error != 0 {
+        return None;
+    }
+    unsafe {
+        let ctx = crate::current_ipc_ctx();
+        let ipc_buffer = (*ctx).ipc_buffer;
+        if ipc_buffer.is_null() {
+            return None;
+        }
+        Some((*ipc_buffer).msg[0] as u8)
+    }
+}
+
 // ---- SchedContext operations ----
 
 /// Configure a scheduling context with budget and period (microseconds).

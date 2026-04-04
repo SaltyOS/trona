@@ -94,9 +94,24 @@ posix_fork:
     ret
 
 fork_child_entry:
-#ifdef SALTY_X86_SIMD
     /* Child starts here with RSP pointing to saved GPRs.
-     * Restore XMM regs from the saved block below, then pop GPRs. */
+     * Call _trona_post_fork_child() BEFORE restoring registers so the
+     * substrate can reinitialise per-process state (IPC context, TLS
+     * fixups, slot allocator) in the freshly-forked child.
+     */
+#ifdef SALTY_X86_SIMD
+    /* XMM save area lives at [RSP-256, RSP).  A normal call would push
+     * a return address and grow the stack into that region, corrupting
+     * the saved SIMD state.  Switch to a temporary 4K BSS stack for the
+     * duration of the call, then switch back. */
+    movq    %rsp, %rax                              /* save real RSP */
+    leaq    _trona_fork_child_stack_top(%rip), %rsp  /* temp stack (0 mod 16) */
+    subq    $8, %rsp                                 /* align: 8 mod 16 */
+    pushq   %rax                                     /* save real RSP (now 0 mod 16 before call) */
+    call    _trona_post_fork_child@PLT
+    popq    %rsp                                     /* restore real RSP */
+
+    /* Now restore XMM regs from the saved block below RSP. */
     movdqu  -256(%rsp), %xmm0
     movdqu  -240(%rsp), %xmm1
     movdqu  -224(%rsp), %xmm2
@@ -113,6 +128,11 @@ fork_child_entry:
     movdqu   -48(%rsp), %xmm13
     movdqu   -32(%rsp), %xmm14
     movdqu   -16(%rsp), %xmm15
+#else
+    /* No SIMD save area below RSP — safe to call directly. */
+    subq    $8, %rsp                /* 16-byte alignment */
+    call    _trona_post_fork_child@PLT
+    addq    $8, %rsp
 #endif
     popq    %r15
     popq    %r14
@@ -122,3 +142,13 @@ fork_child_entry:
     popq    %rbp
     xorl    %eax, %eax              /* return 0 = child */
     ret
+
+/* Temporary 4K stack for _trona_post_fork_child in the SIMD case.
+ * Only used momentarily during fork_child_entry before register restore. */
+#ifdef SALTY_X86_SIMD
+.section .bss._trona_fork_child_stack,"aw",@nobits
+.align 16
+_trona_fork_child_stack:
+    .space  4096
+_trona_fork_child_stack_top:
+#endif

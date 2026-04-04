@@ -618,6 +618,9 @@ void __attribute__((noreturn)) pe_rtld_main(uint64_t *sp) {
         case AT_TRONA_CSPACE_NTFN:
             g_pe_rtld.cspace_ntfn = p[1];
             break;
+        case AT_TRONA_SC_CAP:
+            g_pe_rtld.sc_cap = p[1];
+            break;
         }
     }
 

@@ -47,6 +47,7 @@ uint64_t __trona_next_frame_slot = 0;
 uint64_t __trona_slot_base = 0;
 uint64_t __trona_slot_count = 0;
 uint64_t __trona_cspace_ntfn = 0;
+uint64_t __trona_sc_cap = 0;
 
 /* Exported ELF TLS info so libtrona can set up the TLS data area */
 uint64_t __trona_tls_template = 0;  /* Runtime address of .tdata template */
@@ -240,6 +241,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         case AT_TRONA_SLOT_BASE:  g_rtld.slot_base = p[1]; break;
         case AT_TRONA_SLOT_COUNT: g_rtld.slot_count = p[1]; break;
         case AT_TRONA_CSPACE_NTFN: g_rtld.cspace_ntfn = p[1]; break;
+        case AT_TRONA_SC_CAP:  g_rtld.sc_cap = p[1]; break;
         }
     }
 
@@ -490,6 +492,14 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         uint64_t ntfn_addr = resolve_symbol_addr_in_object(&g_rtld, libtrona_name, "__trona_cspace_ntfn");
         if (ntfn_addr != 0)
             *(volatile uint64_t *)ntfn_addr = g_rtld.cspace_ntfn;
+    }
+
+    /* 7c2. Export SchedContext cap slot for thread pool. */
+    __trona_sc_cap = g_rtld.sc_cap;
+    {
+        uint64_t sc_addr = resolve_symbol_addr_in_object(&g_rtld, libtrona_name, "__trona_sc_cap");
+        if (sc_addr != 0)
+            *(volatile uint64_t *)sc_addr = g_rtld.sc_cap;
     }
 
     /* 7d. Export combined static TLS layout for libtrona. */
