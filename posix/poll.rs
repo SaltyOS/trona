@@ -5,7 +5,6 @@ use trona::consts::kernel::*;
 use trona::protocol::*;
 use trona::types::core::*;
 use trona::types::posix::*;
-use super::CAP_VFS_EP;
 
 /// Wait for events on a set of file descriptors (max 8 per call).
 ///
@@ -17,7 +16,7 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_POLL;
+        msg.label = VFS_POSIX_POLL;
 
         let actual_nfds = if nfds > 8 { 8 } else { nfds };
         msg.regs[0] = actual_nfds as u64;
@@ -30,7 +29,7 @@ pub unsafe fn posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32 {
         }
         msg.length = 2 + actual_nfds as u64 * 2;
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err == TRONA_INTERRUPTED as i32 {
             return -4; // EINTR
         }
@@ -118,11 +117,11 @@ pub unsafe fn posix_epoll_create() -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_EPOLL_CREATE;
+        msg.label = VFS_POSIX_EPOLL_CREATE;
         msg.length = 0;
 
         let err = crate::ipc_call_retry(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -142,7 +141,7 @@ pub unsafe fn posix_epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32, data: u6
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_EPOLL_CTL;
+        msg.label = VFS_POSIX_EPOLL_CTL;
         msg.length = 5;
         msg.regs[0] = epfd as u64;
         msg.regs[1] = op as u64;
@@ -151,7 +150,7 @@ pub unsafe fn posix_epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32, data: u6
         msg.regs[4] = data;
 
         let err = crate::ipc_call_retry(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -178,13 +177,13 @@ pub unsafe fn posix_epoll_wait(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_EPOLL_WAIT;
+        msg.label = VFS_POSIX_EPOLL_WAIT;
         msg.length = 3;
         msg.regs[0] = epfd as u64;
         msg.regs[1] = maxevents as u64;
         msg.regs[2] = timeout as u64;
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err == TRONA_INTERRUPTED as i32 {
             return -4; // EINTR
         }

@@ -3,11 +3,11 @@
 
 use crate::handle::*;
 use crate::error::*;
+use crate::trona;
 
-use trona::consts::kernel::*;
-use trona::consts::server::*;
-use trona::protocol::procmgr::*;
-use trona::types::core::*;
+use crate::trona::consts::kernel::*;
+use crate::trona::protocol::procmgr::*;
+use crate::trona::types::core::*;
 
 /// Pseudo-handle for the current process (matches Windows convention).
 const CURRENT_PROCESS_PSEUDO_HANDLE: HANDLE = -1;
@@ -15,26 +15,11 @@ const CURRENT_PROCESS_PSEUDO_HANDLE: HANDLE = -1;
 /// Win32 ExitProcess — terminate the calling process.
 ///
 /// Sends PM_EXIT to procmgr with blocking IPC so the thread does not resume
-/// in userspace after teardown begins.
+/// in userspace after teardown begins. Win32 client lifecycle is owned by
+/// procmgr/VFS now, so csrss is no longer part of the exit fast path.
 #[unsafe(no_mangle)]
 pub extern "C" fn ExitProcess(u_exit_code: u32) -> ! {
     unsafe {
-        // Notify win32_csrss of client exit (best effort, non-blocking).
-        let ep = *(&raw const crate::crt::__win32srv_ep);
-        if ep != 0 {
-            let mut msg = TronaMsg::zeroed();
-            msg.label = crate::W32_CLIENT_EXIT;
-            msg.regs[0] = u_exit_code as u64;
-            msg.length = 1;
-            let ctx = trona::current_ipc_ctx();
-            for _ in 0..16 {
-                if trona::ipc::nbsend_ctx(ctx, ep, &raw const msg) == 0 {
-                    break;
-                }
-                trona::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-            }
-        }
-
         // PM_EXIT intentionally never gets a reply. Blocking in Call keeps the
         // exiting thread parked in-kernel until procmgr suspends it.
         let mut msg = TronaMsg::zeroed();
@@ -43,7 +28,7 @@ pub extern "C" fn ExitProcess(u_exit_code: u32) -> ! {
         msg.regs[0] = u_exit_code as u64;
         msg.length = 1;
         let ctx = trona::current_ipc_ctx();
-        let _ = trona::ipc::call_ctx(ctx, CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
+        let _ = trona::ipc::call_ctx(ctx, trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
     }
 
     // Should not return — procmgr kills us
@@ -67,7 +52,7 @@ pub extern "C" fn GetCurrentProcessId() -> DWORD {
         msg.label = PM_GETPID;
         msg.length = 0;
         let ctx = trona::current_ipc_ctx();
-        let err = trona::ipc::call_ctx(ctx, CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
+        let err = trona::ipc::call_ctx(ctx, trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
         if err == 0 && reply.label == TRONA_OK {
             reply.regs[0] as DWORD
         } else {

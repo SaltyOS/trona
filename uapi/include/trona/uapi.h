@@ -16,8 +16,8 @@ extern "C" {
 typedef uint64_t trona_cap_t;
 
 typedef struct trona_sysret {
-    uint64_t value;
     uint64_t error;
+    uint64_t value;
 } trona_sysret_t;
 
 enum trona_syscall {
@@ -47,6 +47,9 @@ enum trona_error {
     TRONA_ALREADY_EXISTS = 8,
     TRONA_WOULD_BLOCK = 9,
     TRONA_INTERRUPTED = 15,
+    TRONA_SLOT_OCCUPIED = 0x18,
+    TRONA_ALREADY_MAPPED = 0x19,
+    TRONA_ALREADY_BOUND = 0x1A,
     TRONA_IN_PROGRESS = 0x10,
 };
 

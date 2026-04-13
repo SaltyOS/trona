@@ -13,6 +13,15 @@
 extern uint64_t _tlsdesc_static_resolver(void);
 #endif
 
+static int load_rela_entry(Elf64_Rela *out, const Elf64_Rela *base,
+                           uint64_t ent_size, uint64_t index) {
+    if (!out || !base || ent_size < sizeof(Elf64_Rela))
+        return 0;
+
+    rtld_memcpy(out, (const uint8_t *)base + ent_size * index, sizeof(*out));
+    return 1;
+}
+
 /* Resolve a symbol by index from a given object's symtab */
 static uint64_t resolve_by_index(struct rtld_state *st, struct link_map *map,
                                   uint32_t sym_idx) {
@@ -174,7 +183,10 @@ static void apply_rela(struct rtld_state *st, struct link_map *map,
 int process_relocations(struct rtld_state *st, struct link_map *map) {
     /* Process DT_RELA (non-PLT relocations) */
     for (uint64_t i = 0; i < map->rela_count; i++) {
-        apply_rela(st, map, &map->rela[i]);
+        Elf64_Rela rela;
+        if (!load_rela_entry(&rela, map->rela, map->rela_ent_size, i))
+            break;
+        apply_rela(st, map, &rela);
     }
 
     /* Process DT_JMPREL (PLT relocations) eagerly.
@@ -183,7 +195,10 @@ int process_relocations(struct rtld_state *st, struct link_map *map) {
      * fallback for any we missed or for PLT entries added later.
      */
     for (uint64_t i = 0; i < map->jmprel_count; i++) {
-        apply_rela(st, map, &map->jmprel[i]);
+        Elf64_Rela rela;
+        if (!load_rela_entry(&rela, map->jmprel, map->jmprel_ent_size, i))
+            break;
+        apply_rela(st, map, &rela);
     }
 
     return 0;
@@ -200,8 +215,11 @@ uint64_t _dl_fixup(struct link_map *map, uint64_t reloc_index) {
         return 0;
     }
 
-    Elf64_Rela *rela = &map->jmprel[reloc_index];
-    uint32_t sym_idx = ELF64_R_SYM(rela->r_info);
+    Elf64_Rela rela;
+    if (!load_rela_entry(&rela, map->jmprel, map->jmprel_ent_size, reloc_index)) {
+        return 0;
+    }
+    uint32_t sym_idx = ELF64_R_SYM(rela.r_info);
     Elf64_Sym *sym = &map->symtab[sym_idx];
     const char *name = map->strtab + sym->st_name;
 
@@ -219,7 +237,7 @@ uint64_t _dl_fixup(struct link_map *map, uint64_t reloc_index) {
     }
 
     /* Patch the GOT entry so next call goes directly */
-    uint64_t *got_entry = (uint64_t *)(map->base + rela->r_offset);
+    uint64_t *got_entry = (uint64_t *)(map->base + rela.r_offset);
     *got_entry = addr;
 
     return addr;

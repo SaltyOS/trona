@@ -39,15 +39,7 @@ use crate::types::TronaResult;
 /// Returns a [`TronaResult`] with `error` (0 = success) and `value`
 /// (syscall-specific return payload).
 #[inline(always)]
-pub fn syscall(
-    num: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-    a4: u64,
-    a5: u64,
-) -> TronaResult {
+pub fn syscall(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> TronaResult {
     let error: u64;
     let value: u64;
 
@@ -121,6 +113,14 @@ pub fn futex_wait_timeout(addr: *const u32, expected: u32, timeout_ns: u64) -> u
     .error
 }
 
+#[inline]
+pub fn thread_exit() -> ! {
+    let _ = syscall(crate::consts::SYS_THREAD_EXIT, 0, 0, 0, 0, 0, 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 /// Futex wake: wake up to `count` threads waiting on `addr`.
 /// Returns the number of threads actually woken.
 #[inline]
@@ -162,17 +162,35 @@ pub fn sys_shutdown() -> ! {
 
 /// Send message to endpoint with timeout.
 ///
-/// Returns 0 on success, `TRONA_CANCELLED` (12) on timeout.
+/// Returns 0 on success, `TRONA_CANCELLED` (12) on timeout, or
+/// `TRONA_INVALID_OPERATION` if no IPC buffer is bound (the kernel reads
+/// the timeout from `IpcBuffer.timeout_ns`, so without one the syscall
+/// would silently degrade to a non-blocking send).
 #[inline]
-pub fn sys_send_timed(cap: u64, msg_info: u64, mr0: u64, timeout_ns: u64) -> u64 {
+pub fn sys_send_timed(
+    cap: u64,
+    msg_info: u64,
+    mr0: u64,
+    mr1: u64,
+    mr2: u64,
+    mr3: u64,
+    timeout_ns: u64,
+) -> u64 {
+    unsafe {
+        let ctx = crate::current_ipc_ctx();
+        if ctx.is_null() || (*ctx).ipc_buffer.is_null() {
+            return crate::consts::TRONA_INVALID_OPERATION;
+        }
+        (*(*ctx).ipc_buffer).timeout_ns = timeout_ns;
+    }
     syscall(
         crate::consts::SYS_SEND_TIMED,
         cap,
         msg_info,
         mr0,
-        timeout_ns,
-        0,
-        0,
+        mr1,
+        mr2,
+        mr3,
     )
     .error
 }
@@ -182,15 +200,22 @@ pub fn sys_send_timed(cap: u64, msg_info: u64, mr0: u64, timeout_ns: u64) -> u64
 /// Returns `TronaResult` where:
 /// - `error == 0, value == badge` on success (message in IPC buffer)
 /// - `error == TRONA_CANCELLED` on timeout
+/// - `error == TRONA_INVALID_OPERATION` if no IPC buffer is bound (the
+///   kernel reads the timeout from `IpcBuffer.timeout_ns`, so without one
+///   the syscall would silently degrade to an immediate cancellation).
+///
+/// Timeout is written to `IpcBuffer.timeout_ns` before issuing the syscall.
 #[inline]
 pub fn sys_recv_timed(cap: u64, timeout_ns: u64) -> TronaResult {
-    syscall(
-        crate::consts::SYS_RECV_TIMED,
-        cap,
-        timeout_ns,
-        0,
-        0,
-        0,
-        0,
-    )
+    unsafe {
+        let ctx = crate::current_ipc_ctx();
+        if ctx.is_null() || (*ctx).ipc_buffer.is_null() {
+            return TronaResult {
+                error: crate::consts::TRONA_INVALID_OPERATION,
+                value: 0,
+            };
+        }
+        (*(*ctx).ipc_buffer).timeout_ns = timeout_ns;
+    }
+    syscall(crate::consts::SYS_RECV_TIMED, cap, 0, 0, 0, 0, 0)
 }

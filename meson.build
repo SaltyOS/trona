@@ -140,42 +140,95 @@ trona_loader_rmeta = libtrona_build_dir / 'libtrona_loader.rmeta'
 # =============================================================================
 
 if arch == 'x86_64'
-  kernel32_pe_target = 'x86_64-w64-windows-gnu'
+  kernel32_rust_target = 'x86_64-pc-windows-gnu'
   kernel32_pe_machine = 'amd64'
 elif arch == 'aarch64'
-  kernel32_pe_target = 'aarch64-w64-windows-gnu'
+  kernel32_rust_target = 'aarch64-pc-windows-gnullvm'
   kernel32_pe_machine = 'arm64'
 else
   error('Unsupported arch for kernel32.dll PE build: ' + arch)
 endif
 
-kernel32_pe_args = [
-  '--target=' + kernel32_pe_target,
-  '-ffreestanding',
-  '-fno-stack-protector',
-  '-fno-builtin',
-  '-fvisibility=hidden',
+kernel32_pe_common_args = [
+  '--edition=2024',
+  '--target=' + kernel32_rust_target,
+  '-C', 'panic=abort',
+  '-C', 'opt-level=2',
+  '-C', 'code-model=small',
+  '-C', 'relocation-model=pic',
 ]
+if get_option('debug_symbols')
+  kernel32_pe_common_args += ['-C', 'debuginfo=2']
+endif
+
+kernel32_core = custom_target('kernel32_core',
+  input: [],
+  output: ['core.o', 'libcore.rmeta'],
+  command: [
+    rustc,
+    kernel32_pe_common_args,
+    '--emit=obj,metadata',
+    '--out-dir', '@OUTDIR@',
+    '--crate-name=core',
+    '--crate-type=lib',
+    rust_lib_src / 'core/src/lib.rs',
+  ],
+  build_by_default: true,
+)
+
+kernel32_compiler_builtins = custom_target('kernel32_compiler_builtins',
+  input: files('../../rust/compiler_builtins.rs'),
+  output: ['compiler_builtins.o', 'libcompiler_builtins.rmeta'],
+  command: [
+    rustc,
+    kernel32_pe_common_args,
+    '--cfg', 'trona_mem_builtins',
+    '--emit=obj,metadata',
+    '--out-dir', '@OUTDIR@',
+    '--crate-name=compiler_builtins',
+    '--crate-type=lib',
+    '--sysroot=/dev/null',
+    '--extern', 'core=' + meson.current_build_dir() / 'libcore.rmeta',
+    '-L', meson.current_build_dir(),
+    '@INPUT@',
+  ],
+  depends: [kernel32_core],
+  build_by_default: true,
+)
 
 kernel32_pe_obj = custom_target('kernel32_pe_obj',
-  input: files('win32/kernel32_pe.c'),
-  output: 'kernel32_pe.obj',
-  depfile: 'kernel32_pe.d',
-  command: cc_cmd + kernel32_pe_args + ['-MMD', '-MF', '@DEPFILE@', '-c', '-o', '@OUTPUT@', '@INPUT@'],
+  input: files('win32/kernel32.rs'),
+  output: 'kernel32.o',
+  command: [
+    rustc,
+    kernel32_pe_common_args,
+    '--emit=obj',
+    '--out-dir', '@OUTDIR@',
+    '--crate-name=kernel32',
+    '--crate-type=lib',
+    '--sysroot=/dev/null',
+    '--extern', 'core=' + meson.current_build_dir() / 'libcore.rmeta',
+    '--extern', 'compiler_builtins=' + meson.current_build_dir() / 'libcompiler_builtins.rmeta',
+    '-L', meson.current_build_dir(),
+    '@INPUT@',
+  ],
+  depends: [kernel32_core, kernel32_compiler_builtins],
   build_by_default: true,
 )
 
 kernel32_dll = custom_target('kernel32_dll',
-  input: [kernel32_pe_obj, files('win32/kernel32_pe.def')],
+  input: [kernel32_pe_obj, kernel32_core[0], kernel32_compiler_builtins[0], files('win32/kernel32.def')],
   output: 'kernel32.dll',
   command: [lld_link,
     '-dll',
     '-noentry',
     '-nodefaultlib',
     '-machine:' + kernel32_pe_machine,
-    '-def:@INPUT1@',
+    '-def:@INPUT3@',
     '-out:@OUTPUT@',
     '@INPUT0@',
+    '@INPUT1@',
+    '@INPUT2@',
   ],
   build_by_default: true,
 )

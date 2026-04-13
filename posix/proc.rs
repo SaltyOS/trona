@@ -4,7 +4,6 @@
 use trona::consts::kernel::*;
 use trona::protocol::*;
 use trona::types::core::*;
-use super::CAP_PROCMGR_EP;
 
 const EXEC_MSG_MIN_SLOWPATH_LEN: usize = 5;
 
@@ -32,8 +31,8 @@ impl Itimerval {
 /// on SMP.
 pub unsafe fn posix_exit(status: i32) -> ! {
     unsafe {
-        // Final userspace-side cleanup of exited pthread slots before process teardown.
-        crate::pthread::process_exit_reap();
+        // pthread teardown is now procmgr's responsibility — auxiliary
+        // threads are reaped via RES_RECLAIM_OWNER inside PM_EXIT.
 
         let mut msg = TronaMsg::zeroed();
         msg.label = PM_EXIT;
@@ -45,7 +44,7 @@ pub unsafe fn posix_exit(status: i32) -> ! {
         // This avoids the yield-loop that starves SCHED_IPC_LOCK on SMP.
         let mut reply = TronaMsg::zeroed();
         crate::ipc_call_retry(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -65,7 +64,7 @@ pub unsafe fn posix_getpid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -88,7 +87,7 @@ pub unsafe fn posix_getppid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -119,7 +118,7 @@ pub unsafe fn posix_waitpid3(pid: i32, status: *mut i32, options: i32) -> i32 {
 
             let err = trona::ipc::call_ctx(
                 crate::tls::current_ipc_ctx(),
-                CAP_PROCMGR_EP,
+                trona::caps::procmgr_ep(),
                 &raw const msg,
                 &raw mut reply,
             );
@@ -269,7 +268,7 @@ pub unsafe fn posix_execve(
         debug_assert_eq!(pos, total_str_len);
 
         let err = crate::ipc_call_retry(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -299,7 +298,7 @@ pub unsafe fn posix_kill(pid: i32, sig: i32) -> i32 {
 
             let err = trona::ipc::call_ctx(
                 crate::tls::current_ipc_ctx(),
-                CAP_PROCMGR_EP,
+                trona::caps::procmgr_ep(),
                 &raw const msg,
                 &raw mut reply,
             );
@@ -343,7 +342,7 @@ pub unsafe fn posix_setpgid(pid: i32, pgid: i32) -> i32 {
         msg.regs[1] = pgid as u32 as u64;
 
         let err = crate::ipc_call_retry(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -367,7 +366,7 @@ pub unsafe fn posix_getpgid(pid: i32) -> i32 {
         msg.regs[0] = pid as u32 as u64;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -391,7 +390,7 @@ pub unsafe fn posix_setsid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc_call_retry(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -416,7 +415,7 @@ pub unsafe fn posix_getsid(pid: i32) -> i32 {
         msg.regs[0] = pid as u32 as u64;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -439,7 +438,7 @@ pub unsafe fn posix_getuid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -462,7 +461,7 @@ pub unsafe fn posix_geteuid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -485,7 +484,7 @@ pub unsafe fn posix_getgid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -508,7 +507,7 @@ pub unsafe fn posix_getegid() -> i32 {
         msg.length = 0;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -532,7 +531,7 @@ pub unsafe fn posix_getgroups(size: i32, _list: *mut i32) -> i32 {
         msg.regs[0] = size as u64;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -543,6 +542,212 @@ pub unsafe fn posix_getgroups(size: i32, _list: *mut i32) -> i32 {
             return super::trona_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
+    }
+}
+
+pub unsafe fn posix_setuid(uid: u32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_SETUID;
+        msg.length = 1;
+        msg.regs[0] = uid as u64;
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        0
+    }
+}
+
+pub unsafe fn posix_setgid(gid: u32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_SETGID;
+        msg.length = 1;
+        msg.regs[0] = gid as u64;
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        0
+    }
+}
+
+pub unsafe fn posix_seteuid(euid: u32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_SETEUID;
+        msg.length = 1;
+        msg.regs[0] = euid as u64;
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        0
+    }
+}
+
+pub unsafe fn posix_setegid(egid: u32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_SETEGID;
+        msg.length = 1;
+        msg.regs[0] = egid as u64;
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        0
+    }
+}
+
+pub unsafe fn posix_setreuid(ruid: u32, euid: u32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_SETREUID;
+        msg.length = 2;
+        msg.regs[0] = ruid as u64;
+        msg.regs[1] = euid as u64;
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        0
+    }
+}
+
+pub unsafe fn posix_setregid(rgid: u32, egid: u32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_SETREGID;
+        msg.length = 2;
+        msg.regs[0] = rgid as u64;
+        msg.regs[1] = egid as u64;
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        0
+    }
+}
+
+pub unsafe fn posix_setgroups(ngroups: usize, groups: *const u32) -> i32 {
+    unsafe {
+        if ngroups > 32 { return -22; }
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_SETGROUPS;
+        msg.regs[0] = ngroups as u64;
+        let mut gi = 0usize;
+        let mut ri = 1usize;
+        while gi < ngroups {
+            let lo = *groups.add(gi) as u64;
+            gi += 1;
+            let hi = if gi < ngroups { let v = *groups.add(gi) as u64; gi += 1; v } else { 0 };
+            msg.regs[ri] = lo | (hi << 32);
+            ri += 1;
+        }
+        msg.length = ri as u64;
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        0
+    }
+}
+
+pub unsafe fn posix_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_GETRESUID;
+        msg.length = 0;
+        let err = crate::ipc_call_retry_idempotent(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        if !ruid.is_null() { *ruid = reply.regs[0] as u32; }
+        if !euid.is_null() { *euid = reply.regs[1] as u32; }
+        if !suid.is_null() { *suid = reply.regs[2] as u32; }
+        0
+    }
+}
+
+pub unsafe fn posix_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_GETRESGID;
+        msg.length = 0;
+        let err = crate::ipc_call_retry_idempotent(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        if !rgid.is_null() { *rgid = reply.regs[0] as u32; }
+        if !egid.is_null() { *egid = reply.regs[1] as u32; }
+        if !sgid.is_null() { *sgid = reply.regs[2] as u32; }
+        0
+    }
+}
+
+pub unsafe fn posix_setresuid(ruid: u32, euid: u32, suid: u32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_SETRESUID;
+        msg.length = 3;
+        msg.regs[0] = ruid as u64;
+        msg.regs[1] = euid as u64;
+        msg.regs[2] = suid as u64;
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        0
+    }
+}
+
+pub unsafe fn posix_setresgid(rgid: u32, egid: u32, sgid: u32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_SETRESGID;
+        msg.length = 3;
+        msg.regs[0] = rgid as u64;
+        msg.regs[1] = egid as u64;
+        msg.regs[2] = sgid as u64;
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        0
+    }
+}
+
+pub unsafe fn posix_getrlimit(resource: u32, rlim_cur: *mut u64, rlim_max: *mut u64) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_GETRLIMIT;
+        msg.length = 1;
+        msg.regs[0] = resource as u64;
+        let err = crate::ipc_call_retry_idempotent(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        if !rlim_cur.is_null() { *rlim_cur = reply.regs[0]; }
+        if !rlim_max.is_null() { *rlim_max = reply.regs[1]; }
+        0
+    }
+}
+
+pub unsafe fn posix_setrlimit(resource: u32, rlim_cur: u64, rlim_max: u64) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = PM_SETRLIMIT;
+        msg.length = 3;
+        msg.regs[0] = resource as u64;
+        msg.regs[1] = rlim_cur;
+        msg.regs[2] = rlim_max;
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
+        if err != 0 { return super::call_err_to_posix(err); }
+        if reply.label != TRONA_OK { return super::trona_err_to_posix(reply.label); }
+        0
     }
 }
 
@@ -568,7 +773,7 @@ pub unsafe fn posix_setitimer(
         msg.regs[4] = new_value.it_interval.tv_usec;
 
         let err = crate::ipc_call_retry(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -602,7 +807,7 @@ pub unsafe fn posix_getitimer(which: i32, curr_value: *mut Itimerval) -> i32 {
         msg.regs[0] = which as u64;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );

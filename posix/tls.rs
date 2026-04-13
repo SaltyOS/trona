@@ -82,10 +82,29 @@ pub unsafe fn init_main_thread_tls() {
     unsafe {
         trona::tls::init_main_thread_tls();
 
+        // Install the POSIX cancellation hook into the substrate sync layer
+        // so that blocking primitives (Condvar::wait, etc.) can invoke
+        // pthread_testcancel() when a cancellation is pending.
+        trona::sync::install_cancel_hook(posix_cancel_impl);
+
         // After substrate TLS init, initialize the POSIX personality
         // for the main thread's descriptor.
         if let Some(tls) = current_tls() {
             crate::pthread::init_main_thread_control(tls);
         }
     }
+}
+
+/// Cancellation hook installed into the substrate sync layer.
+///
+/// Called by blocking primitives after they observe `cancel_pending` on
+/// the current thread's TLS block.
+///
+/// # Safety
+///
+/// This function calls `pthread_testcancel()`, which may unwind the thread
+/// via `pthread_exit`. The caller (substrate sync code) must not hold any
+/// locks when invoking this hook.
+unsafe fn posix_cancel_impl() {
+    unsafe { crate::pthread::pthread_testcancel() };
 }

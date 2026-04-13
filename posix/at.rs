@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! POSIX *at() operations (openat, fstatat, unlinkat, renameat, symlinkat).
 
+use super::pack_path;
 use trona::consts::kernel::*;
 use trona::protocol::*;
 use trona::types::core::*;
 use trona::types::posix::*;
-use super::{pack_path, CAP_VFS_EP};
 
 /// openat(dirfd, path, flags, mode)
 /// IPC: reg[0]=dirfd, reg[1]=open_flags, reg[2]=mode, reg[3..]=path(len+data)
@@ -14,14 +14,14 @@ pub unsafe fn posix_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -
         let mode = mode & !super::misc::get_umask();
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_OPENAT;
+        msg.label = VFS_POSIX_OPENAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = flags as u32 as u64;
         msg.regs[2] = mode as u64;
         let path_len = pack_path(&raw mut msg, 3, path, 128);
         msg.length = 4 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -38,13 +38,13 @@ pub unsafe fn posix_fstatat(dirfd: i32, path: *const u8, st: *mut TronaStat, at_
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_FSTATAT;
+        msg.label = VFS_POSIX_FSTATAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = at_flags as u32 as u64;
         let path_len = pack_path(&raw mut msg, 2, path, 128);
         msg.length = 3 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry_idempotent(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -72,13 +72,13 @@ pub unsafe fn posix_unlinkat(dirfd: i32, path: *const u8, at_flags: i32) -> i32 
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_UNLINKAT;
+        msg.label = VFS_POSIX_UNLINKAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = at_flags as u32 as u64;
         let path_len = pack_path(&raw mut msg, 2, path, 128);
         msg.length = 3 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -100,7 +100,7 @@ pub unsafe fn posix_renameat(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_RENAMEAT;
+        msg.label = VFS_POSIX_RENAMEAT;
 
         let mut old_len: u8 = 0;
         while *old_path.add(old_len as usize) != 0 && old_len < 64 {
@@ -134,7 +134,7 @@ pub unsafe fn posix_renameat(
         }
         msg.length = 4 + ((old_len as u64 + 7) / 8) + ((new_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -152,13 +152,13 @@ pub unsafe fn posix_mkdirat(dirfd: i32, path: *const u8, mode: i32) -> i32 {
         let mode = (mode as u32) & !super::misc::get_umask();
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_MKDIRAT;
+        msg.label = VFS_POSIX_MKDIRAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = mode as u64;
         let path_len = pack_path(&raw mut msg, 2, path, 128);
         msg.length = 3 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -175,14 +175,14 @@ pub unsafe fn posix_faccessat(dirfd: i32, path: *const u8, mode: i32, at_flags: 
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_FACCESSAT;
+        msg.label = VFS_POSIX_FACCESSAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = mode as u64;
         msg.regs[2] = at_flags as u32 as u64;
         let path_len = pack_path(&raw mut msg, 3, path, 128);
         msg.length = 4 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry_idempotent(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -199,14 +199,14 @@ pub unsafe fn posix_fchmodat(dirfd: i32, path: *const u8, mode: u32, at_flags: i
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_FCHMODAT;
+        msg.label = VFS_POSIX_FCHMODAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = mode as u64;
         msg.regs[2] = at_flags as u32 as u64;
         let path_len = pack_path(&raw mut msg, 3, path, 128);
         msg.length = 4 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -229,7 +229,7 @@ pub unsafe fn posix_fchownat(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_FCHOWNAT;
+        msg.label = VFS_POSIX_FCHOWNAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = uid as u64;
         msg.regs[2] = gid as u64;
@@ -237,7 +237,7 @@ pub unsafe fn posix_fchownat(
         let path_len = pack_path(&raw mut msg, 4, path, 128);
         msg.length = 5 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -262,7 +262,7 @@ pub unsafe fn posix_utimensat(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_UTIMENSAT;
+        msg.label = VFS_POSIX_UTIMENSAT;
         msg.regs[0] = dirfd as u32 as u64;
         msg.regs[1] = at_flags as u32 as u64;
         msg.regs[2] = atime_sec as u64;
@@ -272,7 +272,7 @@ pub unsafe fn posix_utimensat(
         let path_len = pack_path(&raw mut msg, 6, path, 128);
         msg.length = 7 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -284,16 +284,14 @@ pub unsafe fn posix_utimensat(
 }
 
 /// Create a symbolic link at `linkpath` (relative to `newdirfd`) pointing to `target`.
-/// IPC layout: regs[0]=newdirfd, regs[1]=target_len, regs[2..10]=target(64B), regs[10]=link_len, regs[11..19]=link(64B)
+/// IPC layout: regs[0]=target_len, regs[1]=newdirfd, regs[2]=link_len,
+/// regs[3..]=linkpath bytes, followed by target bytes.
 /// Returns 0 on success, -1 on error.
 pub unsafe fn posix_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_SYMLINKAT;
-
-        // newdirfd in regs[0]
-        msg.regs[0] = newdirfd as u32 as u64;
+        msg.label = VFS_POSIX_SYMLINKAT;
 
         // Measure target length
         let mut target_len: u8 = 0;
@@ -307,23 +305,29 @@ pub unsafe fn posix_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const
             link_len += 1;
         }
 
-        // Pack target into regs[1..10]: regs[1]=target_len, regs[2..10]=target bytes
-        msg.regs[1] = target_len as u64;
-        let dst = &mut msg.regs[2] as *mut u64 as *mut u8;
-        for i in 0..target_len as usize {
-            *dst.add(i) = *target.add(i);
+        let link_regs = (link_len as usize + 7) / 8;
+        let target_regs = (target_len as usize + 7) / 8;
+        if 3 + link_regs + target_regs > 20 {
+            return -36; // ENAMETOOLONG
         }
 
-        // Pack link path into regs[10..19]: regs[10]=link_len, regs[11..19]=link bytes
-        msg.regs[10] = link_len as u64;
-        let dst2 = &mut msg.regs[11] as *mut u64 as *mut u8;
+        msg.regs[0] = target_len as u64;
+        msg.regs[1] = newdirfd as u32 as u64;
+        msg.regs[2] = link_len as u64;
+
+        let dst2 = &mut msg.regs[3] as *mut u64 as *mut u8;
         for i in 0..link_len as usize {
             *dst2.add(i) = *linkpath.add(i);
         }
 
-        msg.length = 19;
+        let dst = (&mut msg.regs[3 + link_regs]) as *mut u64 as *mut u8;
+        for i in 0..target_len as usize {
+            *dst.add(i) = *target.add(i);
+        }
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        msg.length = (3 + link_regs + target_regs) as u64;
+
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -342,12 +346,12 @@ pub unsafe fn posix_readlinkat(dirfd: i32, path: *const u8, buf: *mut u8, bufsiz
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_READLINKAT;
+        msg.label = VFS_POSIX_READLINKAT;
         msg.regs[0] = dirfd as u32 as u64;
         let path_len = pack_path(&raw mut msg, 1, path, 128);
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry_idempotent(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix_i64(err);
         }
@@ -356,7 +360,11 @@ pub unsafe fn posix_readlinkat(dirfd: i32, path: *const u8, buf: *mut u8, bufsiz
         }
 
         let target_len = reply.regs[0] as usize;
-        let copy_len = if target_len < bufsiz { target_len } else { bufsiz };
+        let copy_len = if target_len < bufsiz {
+            target_len
+        } else {
+            bufsiz
+        };
         let src = &reply.regs[1] as *const u64 as *const u8;
         for i in 0..copy_len {
             *buf.add(i) = *src.add(i);
@@ -371,14 +379,16 @@ pub unsafe fn posix_readlinkat(dirfd: i32, path: *const u8, buf: *mut u8, bufsiz
 ///             regs[3]=old_len, regs[4]=new_len, regs[5..]=oldpath||newpath (8-byte aligned)
 /// Returns 0 on success, -1 on error.
 pub unsafe fn posix_linkat(
-    olddirfd: i32, oldpath: *const u8,
-    newdirfd: i32, newpath: *const u8,
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
     flags: i32,
 ) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_LINKAT;
+        msg.label = VFS_POSIX_LINKAT;
 
         // Measure old path length
         let mut old_len: u8 = 0;
@@ -419,7 +429,7 @@ pub unsafe fn posix_linkat(
         }
         msg.length = 5 + ((old_len as u64 + 7) / 8) + ((new_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }

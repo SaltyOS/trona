@@ -176,6 +176,31 @@ static inline void *rtld_memset(void *dst, int c, size_t n) {
     return dst;
 }
 
+static inline int rtld_has_prefix(const char *s, const char *prefix) {
+    while (*prefix) {
+        if (*s++ != *prefix++)
+            return 0;
+    }
+    return 1;
+}
+
+static inline int rtld_copy_cstr(char *dst, size_t dst_len, const char *src) {
+    size_t i = 0;
+
+    if (dst_len == 0)
+        return 0;
+
+    while (src[i] != '\0') {
+        if (i + 1 >= dst_len)
+            return 0;
+        dst[i] = src[i];
+        i++;
+    }
+
+    dst[i] = '\0';
+    return 1;
+}
+
 /* ============================================================
  * SaltyOS Syscall ABI (from salty.h)
  * ============================================================ */
@@ -210,8 +235,6 @@ static inline void *rtld_memset(void *dst, int c, size_t n) {
 #define VSPACE_FLAG_EXECUTABLE    (1 << 2)
 
 typedef uint64_t cap_t;
-/* Well-known child cap slot for initrd pseudo-device untyped */
-#define CAP_INITRD_UNTYPED  12
 #define CAP_UNTYPED_START   16
 #define CAP_UNTYPED_END     24
 
@@ -257,18 +280,6 @@ static inline uint64_t rtld_vspace_map_device(cap_t vspace, cap_t dev_ut,
 
 static inline void rtld_yield(void) {
     rtld_syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-}
-
-/* Terminate process via PM_EXIT to procmgr (cap slot 3).
- * PM_EXIT label = 2, length = 1, MR0 = exit_code.
- * Use Call rather than Send so the exiting thread stays in-kernel until
- * procmgr suspends it. */
-#define CAP_PROCMGR_EP   3
-#define PM_EXIT_LABEL     2
-static inline void __attribute__((noreturn)) rtld_exit(int code) {
-    uint64_t msg_info = ((uint64_t)PM_EXIT_LABEL << 12) | 1;
-    rtld_syscall(SYS_CALL, CAP_PROCMGR_EP, msg_info, (uint64_t)code, 0, 0, 0);
-    for (;;) rtld_yield();
 }
 
 /* ============================================================
@@ -381,6 +392,7 @@ typedef struct {
 #define DT_SONAME     14
 #define DT_SYMBOLIC   16
 #define DT_REL        17
+#define DT_PLTREL     20
 #define DT_JMPREL     23
 #define DT_INIT_ARRAY   25
 #define DT_FINI_ARRAY   26
@@ -426,12 +438,50 @@ typedef struct {
 #define AT_TRONA_SCRATCH     0x1002
 #define AT_TRONA_INITRD      0x1003
 #define AT_TRONA_INITRD_SZ   0x1004
-#define AT_TRONA_FRAME_SLOT  0x1005
+#define AT_TRONA_CSPACE_LAYOUT 0x1005
 #define AT_TRONA_SHARED_LIB_BASE  0x1006
-#define AT_TRONA_SLOT_BASE   0x1007
-#define AT_TRONA_SLOT_COUNT  0x1008
 #define AT_TRONA_CSPACE_NTFN 0x100A
-#define AT_TRONA_SC_CAP  0x100E
+#define AT_TRONA_IPC_BUFFER  0x100C
+#define AT_TRONA_SC_CAP      0x100E
+
+/* Legacy per-cap AT_TRONA_*_EP / _NTFN / _UNTYPED / _IOPORT tags have
+ * been removed — every role-bearing cap is now delivered via the
+ * role-based startup cap_table (AT_TRONA_CAP_TABLE). */
+
+/* `AT_TRONA_CAP_TABLE`, the cap-table magic/version, all `ROLE_*`
+ * constants, `LOCAL_ROLE_BASE/END`, and the `CAP_TBL_{RIGHT,FLAG}_*`
+ * bits are generated from `lib/trona/uapi/consts/kernel.rs` by
+ * `tools/role_map_gen.py` and landed in the build directory. meson
+ * adds that dir to the include path via `rtld_generated_dir`. */
+#include "cap_table_roles.h"
+
+struct trona_cap_entry_v1 {
+    uint32_t role_id;
+    uint32_t slot;
+    uint32_t rights;
+    uint32_t flags;
+};
+
+struct trona_cap_table_v1 {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t count;
+    uint32_t reserved;
+    /* Flexible array: `count` `trona_cap_entry_v1` records follow. */
+};
+
+struct trona_cspace_layout_v1 {
+    uint64_t version;
+    uint64_t flags;
+    uint64_t cnode_bits;
+    uint64_t frame_slot_base;
+    uint64_t alloc_base;
+    uint64_t alloc_limit;
+    uint64_t recv_base;
+    uint64_t recv_limit;
+    uint64_t expand_base;
+    uint64_t expand_limit;
+};
 
 /* ============================================================
  * CPIO parser (inline, self-contained)
@@ -533,9 +583,13 @@ static inline int rtld_cpio_find(const uint8_t *archive, size_t archive_len,
  * link_map -- one per loaded ELF object
  * ============================================================ */
 
+#define RTLD_MAX_OBJECT_NAME 96
+#define RTLD_INITRD_LIB_PREFIX "lib/"
+
 struct link_map {
     uint64_t    base;       /* Load base address */
     const char *name;       /* Object name */
+    char        name_storage[RTLD_MAX_OBJECT_NAME];
     Elf64_Sym  *symtab;     /* DT_SYMTAB */
     uint64_t    symtab_count;
     uint64_t    sym_ent_size;
@@ -544,9 +598,11 @@ struct link_map {
     uint32_t   *gnu_hash;   /* DT_GNU_HASH */
     Elf64_Rela *jmprel;     /* DT_JMPREL (PLT relocations) */
     uint64_t    jmprel_count;
+    uint64_t    jmprel_ent_size;
     uint64_t   *pltgot;     /* DT_PLTGOT */
     Elf64_Rela *rela;       /* DT_RELA (non-PLT relocations) */
     uint64_t    rela_count;
+    uint64_t    rela_ent_size;
     uint64_t    load_size;  /* Page-aligned total footprint in VA */
     void       (*init_fn)(void);      /* DT_INIT function pointer */
     void      (**init_array)(void);   /* DT_INIT_ARRAY base pointer */
@@ -557,8 +613,35 @@ struct link_map {
     uint64_t    tls_align;      /* PT_TLS alignment */
     int64_t     tls_tpoff;      /* Module base relative to TP (arch ABI specific) */
     uint64_t    tls_module_id;  /* 1-based module ID for __tls_get_addr */
+    Elf64_Dyn  *dyn_section;   /* Mapped .dynamic section (for DT_NEEDED walk) */
     struct link_map *next;
 };
+
+static inline int rtld_make_canonical_object_name(
+    const char *name,
+    char *dst,
+    size_t dst_len
+) {
+    const size_t prefix_len = sizeof(RTLD_INITRD_LIB_PREFIX) - 1;
+    const size_t name_len = rtld_strlen(name);
+
+    if (rtld_has_prefix(name, RTLD_INITRD_LIB_PREFIX))
+        return rtld_copy_cstr(dst, dst_len, name);
+
+    if (prefix_len + name_len + 1 > dst_len)
+        return 0;
+
+    rtld_memcpy(dst, RTLD_INITRD_LIB_PREFIX, prefix_len);
+    rtld_memcpy(dst + prefix_len, name, name_len + 1);
+    return 1;
+}
+
+static inline int rtld_set_object_name(struct link_map *map, const char *name) {
+    if (!rtld_make_canonical_object_name(name, map->name_storage, sizeof(map->name_storage)))
+        return 0;
+    map->name = map->name_storage;
+    return 1;
+}
 
 struct rtld_tls_module {
     uint64_t module_id;
@@ -572,7 +655,7 @@ struct rtld_tls_module {
  * rtld_state -- global dynamic linker state
  * ============================================================ */
 
-#define RTLD_MAX_OBJECTS  8
+#define RTLD_MAX_OBJECTS  16
 
 struct rtld_state {
     struct link_map objects[RTLD_MAX_OBJECTS];
@@ -583,6 +666,7 @@ struct rtld_state {
     cap_t    untyped;
     cap_t    vspace;
     uint64_t scratch_vaddr;
+    uint64_t ipc_buffer_vaddr;
     uint64_t initrd_base;
     uint64_t initrd_size;
     uint64_t next_frame_slot;
@@ -597,15 +681,33 @@ struct rtld_state {
     /* Shared library pre-mapping (0 if not pre-mapped) */
     uint64_t shared_lib_base;
 
-    /* Per-process slot pool (from AT_TRONA_SLOT_BASE/COUNT) */
-    uint64_t slot_base;
-    uint64_t slot_count;
+    /* Child CSpace layout descriptor (from AT_TRONA_CSPACE_LAYOUT) */
+    struct trona_cspace_layout_v1 *cspace_layout;
 
     /* CSpace expansion notification cap (from AT_TRONA_CSPACE_NTFN) */
     uint64_t cspace_ntfn;
 
     /* SchedContext cap slot for the main thread (from AT_TRONA_SC_CAP) */
     uint64_t sc_cap;
+
+    /* Cap slots that rtld itself reads. Every other role-bearing cap
+     * is written directly into libtrona.so's `__trona_cap_*` weak
+     * symbols by the cap_table walker — rtld keeps no other per-role
+     * mirror. These two are the exceptions:
+     *
+     * - `cap_procmgr_ep`:   used by `rtld_exit` to send PM_EXIT before
+     *   yielding forever. Populated from `ROLE_PROCMGR_CONTROL`.
+     * - `cap_initrd_untyped`: used by `rtld_elf.c` to device-map RO/RX
+     *   library pages straight out of the initrd untyped, bypassing
+     *   the per-process frame allocator. Populated from
+     *   `ROLE_INITRD_UNTYPED`. */
+    uint64_t cap_procmgr_ep;
+    uint64_t cap_initrd_untyped;
+
+    /* Pointer to the child's startup capability table, from
+     * AT_TRONA_CAP_TABLE. NULL until stage-1 spawners start emitting it.
+     * Stage 2 readers prefer this over the individual cap_* fields above. */
+    struct trona_cap_table_v1 *cap_table;
 
     /* Combined static TLS layout (exe + loaded PT_TLS DSOs) */
     uint64_t tls_memsz;
@@ -621,11 +723,25 @@ struct rtld_state {
 
 extern struct rtld_state g_rtld;
 
+/* Terminate process via PM_EXIT to procmgr.
+ * PM_EXIT label = 2, length = 1, MR0 = exit_code.
+ * Use Call rather than Send so the exiting thread stays in-kernel until
+ * procmgr suspends it. The procmgr endpoint cap slot is delivered via
+ * the ROLE_PROCMGR_CONTROL entry of the startup cap_table and cached
+ * in g_rtld.cap_procmgr_ep by the walker in rtld_main.c. */
+#define PM_EXIT_LABEL     2
+static inline void __attribute__((noreturn)) rtld_exit(int code) {
+    uint64_t msg_info = ((uint64_t)PM_EXIT_LABEL << 12) | 1;
+    rtld_syscall(SYS_CALL, g_rtld.cap_procmgr_ep, msg_info, (uint64_t)code, 0, 0, 0);
+    for (;;) rtld_yield();
+}
+
 /* ============================================================
  * Function declarations
  * ============================================================ */
 
 void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base);
+struct link_map *find_loaded_object(struct rtld_state *st, const char *name);
 int load_shared_library(struct rtld_state *st, const char *name, uint64_t load_addr);
 uint64_t resolve_symbol_addr(struct rtld_state *st, const char *name);
 uint64_t gnu_hash_lookup(struct link_map *map, const char *name);

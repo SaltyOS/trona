@@ -2,7 +2,7 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 //!
 //! Provides a personality-neutral worker thread pool where N threads all
-//! recv on the same endpoint. The kernel dispatches messages to available
+//! recv on the same endpoint set. The kernel dispatches messages to available
 //! workers (FIFO wake). Each worker handles one request at a time.
 //!
 //! # Usage
@@ -11,7 +11,8 @@
 //! unsafe {
 //!     worker::run_workers(&WorkerConfig {
 //!         worker_count: 4,
-//!         endpoint: MY_EP,
+//!         endpoints: (&MY_EP) as *const _,
+//!         endpoint_count: 1,
 //!         untyped: MY_UT,
 //!         self_tcb: CAP_SELF_TCB,
 //!         self_sc: SC_CAP,
@@ -29,9 +30,10 @@
 //! Workers are first-class threads in the substrate thread pool with full
 //! TLS (IPC context, thread_id, errno). They use `ThreadOwner::Worker`.
 //!
-//! The handler receives pointers to the incoming message, badge, and a reply
-//! buffer. It fills the reply buffer and returns `true` to continue the loop,
-//! or `false` to shut down this worker.
+//! The handler receives pointers to the incoming message, badge, recv source,
+//! and a reply buffer. It fills the reply buffer and returns a
+//! [`WorkerLoopControl`] describing whether the loop should send a reply,
+//! skip the reply and receive the next request, or exit this worker.
 //!
 //! Worker #0 (the main thread) must never return `false` — if it does, the
 //! process enters an infinite yield loop. Non-main workers that return
@@ -42,11 +44,11 @@ use crate::invoke;
 use crate::ipc;
 use crate::slot_alloc;
 use crate::syscall::syscall;
-use crate::tls::{
-    self, ThreadDesc, ThreadOwner, TD_EXITED, TD_REAPING, TD_RUNNING, TD_UNUSED,
+use crate::tls::{self, ThreadDesc, ThreadOwner, TD_EXITED, TD_REAPING, TD_RUNNING, TD_UNUSED};
+use crate::types::core::{
+    Cap, IpcBuffer, IpcContext, ThreadLocalBlock, TronaMsg, IPC_BUFFER_RESERVED_WORDS,
 };
-use crate::types::core::{Cap, IpcBuffer, IpcContext, ThreadLocalBlock, TronaMsg};
-use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -54,6 +56,8 @@ use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Maximum worker threads (including main thread as worker #0).
 const MAX_WORKERS: usize = 32;
+/// Maximum shared receive endpoints staged into the IPC buffer.
+const MAX_WORKER_ENDPOINTS: usize = IPC_BUFFER_RESERVED_WORDS;
 
 /// Default worker stack size: 16 pages (64 KiB).
 const DEFAULT_STACK_PAGES: u64 = 16;
@@ -87,7 +91,9 @@ pub struct SpinLock {
 
 impl SpinLock {
     pub const fn new() -> Self {
-        SpinLock { lock: AtomicU32::new(0) }
+        SpinLock {
+            lock: AtomicU32::new(0),
+        }
     }
 
     #[inline]
@@ -121,9 +127,25 @@ impl SpinLock {
 /// - `badge`: sender badge
 /// - `reply`: reply buffer to fill
 ///
-/// Returns `true` to reply and continue the loop, `false` to exit this worker.
-pub type WorkerHandler =
-    unsafe fn(ctx: *mut IpcContext, msg: *mut TronaMsg, badge: u64, reply: *mut TronaMsg) -> bool;
+pub enum WorkerLoopControl {
+    Reply,
+    SkipReply,
+    Exit,
+}
+
+/// Returns a [`WorkerLoopControl`] indicating how the worker loop should
+/// handle the post-dispatch receive.
+pub type WorkerHandler = unsafe fn(
+    ctx: *mut IpcContext,
+    msg: *mut TronaMsg,
+    badge: u64,
+    recv_source: u64,
+    reply: *mut TronaMsg,
+) -> WorkerLoopControl;
+
+pub type WorkerEnterHook = unsafe fn(ctx: *mut IpcContext, worker_idx: usize);
+pub type WorkerTimeoutHook = unsafe fn(ctx: *mut IpcContext, worker_idx: usize);
+pub type WorkerTimeoutNsHook = unsafe fn(ctx: *mut IpcContext, worker_idx: usize) -> u64;
 
 // ---------------------------------------------------------------------------
 // WorkerConfig
@@ -134,8 +156,10 @@ pub struct WorkerConfig {
     /// Number of worker threads (including main thread as worker #0).
     /// Clamped to 1..MAX_WORKERS.
     pub worker_count: usize,
-    /// Endpoint capability to recv/reply_recv on.
-    pub endpoint: Cap,
+    /// Shared receive endpoints to stage for recv_any/reply_recv_any.
+    pub endpoints: *const Cap,
+    /// Number of endpoints in `endpoints`.
+    pub endpoint_count: usize,
     /// Untyped capability to retype kernel objects from.
     pub untyped: Cap,
     /// Caller's own TCB cap (slot 0 typically).
@@ -153,6 +177,12 @@ pub struct WorkerConfig {
     /// CNode guard depth for tcb_set_space_with_depth. 0 = use default
     /// tcb_set_space (no explicit depth).
     pub cspace_depth: u64,
+    /// Optional hook called on each worker before the first receive.
+    pub on_enter: Option<WorkerEnterHook>,
+    /// Optional timeout computation hook. Returning 0 blocks indefinitely.
+    pub next_timeout_ns: Option<WorkerTimeoutNsHook>,
+    /// Optional hook called after a timed receive/reply_recv returns timeout.
+    pub on_timeout: Option<WorkerTimeoutHook>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,24 +205,31 @@ impl WorkerSlot {
     }
 }
 
-static mut WORKER_SLOTS: [WorkerSlot; MAX_WORKERS] =
-    [const { WorkerSlot::zeroed() }; MAX_WORKERS];
+static mut WORKER_SLOTS: [WorkerSlot; MAX_WORKERS] = [const { WorkerSlot::zeroed() }; MAX_WORKERS];
 
 /// Shared config snapshot (set once by run_workers, read by all workers).
 static mut WORKER_CFG: WorkerCfgSnapshot = WorkerCfgSnapshot::zeroed();
 
 struct WorkerCfgSnapshot {
-    endpoint: Cap,
+    endpoints: [Cap; MAX_WORKER_ENDPOINTS],
+    endpoint_count: usize,
     handler: Option<WorkerHandler>,
     worker_count: usize,
+    on_enter: Option<WorkerEnterHook>,
+    next_timeout_ns: Option<WorkerTimeoutNsHook>,
+    on_timeout: Option<WorkerTimeoutHook>,
 }
 
 impl WorkerCfgSnapshot {
     const fn zeroed() -> Self {
         WorkerCfgSnapshot {
-            endpoint: 0,
+            endpoints: [0; MAX_WORKER_ENDPOINTS],
+            endpoint_count: 0,
             handler: None,
             worker_count: 0,
+            on_enter: None,
+            next_timeout_ns: None,
+            on_timeout: None,
         }
     }
 }
@@ -233,7 +270,9 @@ pub unsafe fn run_workers(config: &WorkerConfig, handler: WorkerHandler) -> ! {
             b"[WORKER] FATAL: THREAD_LOCAL_ACTIVE not set - TLS not initialized\n",
         );
         loop {
-            unsafe { syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0); }
+            unsafe {
+                syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            }
         }
     }
 
@@ -249,10 +288,18 @@ pub unsafe fn run_workers(config: &WorkerConfig, handler: WorkerHandler) -> ! {
     // Kernel SC tick granularity: budget_us/1000 must be >= 1 (i.e., >= 1000 us).
     let budget_per_worker = if config.pool_budget_us == 0 {
         let auto = period_us / (worker_count as u64);
-        if auto < MIN_BUDGET_US { MIN_BUDGET_US } else { auto }
+        if auto < MIN_BUDGET_US {
+            MIN_BUDGET_US
+        } else {
+            auto
+        }
     } else {
         let per = config.pool_budget_us / (worker_count as u64);
-        if per < MIN_BUDGET_US { MIN_BUDGET_US } else { per }
+        if per < MIN_BUDGET_US {
+            MIN_BUDGET_US
+        } else {
+            per
+        }
     };
 
     let stack_pages = if config.stack_pages == 0 {
@@ -261,12 +308,36 @@ pub unsafe fn run_workers(config: &WorkerConfig, handler: WorkerHandler) -> ! {
         config.stack_pages
     };
 
+    if config.endpoints.is_null()
+        || config.endpoint_count == 0
+        || config.endpoint_count > MAX_WORKER_ENDPOINTS
+    {
+        crate::serial::serial_puts(b"[WORKER] invalid endpoint count\n");
+        loop {
+            unsafe {
+                syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+            }
+        }
+    }
+
     // Store shared config snapshot
     unsafe {
         let cfg = &raw mut WORKER_CFG;
-        (*cfg).endpoint = config.endpoint;
+        let mut idx = 0usize;
+        while idx < config.endpoint_count {
+            (*cfg).endpoints[idx] = *config.endpoints.add(idx);
+            idx += 1;
+        }
+        while idx < MAX_WORKER_ENDPOINTS {
+            (*cfg).endpoints[idx] = 0;
+            idx += 1;
+        }
+        (*cfg).endpoint_count = config.endpoint_count;
         (*cfg).handler = Some(handler);
         (*cfg).worker_count = worker_count;
+        (*cfg).on_enter = config.on_enter;
+        (*cfg).next_timeout_ns = config.next_timeout_ns;
+        (*cfg).on_timeout = config.on_timeout;
     }
 
     // Worker #0 = main thread (already has TLS from init_main_thread_tls).
@@ -518,10 +589,10 @@ unsafe fn spawn_worker(
         let stack_top = stack_va + stack_pages * 0x1000;
         let trampoline_rsp = stack_top - 32; // 4 x 8 bytes: [worker_idx, pool_idx, fake_ret, pad]
         let args = trampoline_rsp as *mut u64;
-        *args = worker_idx as u64;          // arg 0: worker index
-        *(args.add(1)) = pool_idx as u64;   // arg 1: thread pool index
-        *(args.add(2)) = 0;                 // fake return address (x86_64)
-        *(args.add(3)) = 0;                 // padding (16-byte alignment)
+        *args = worker_idx as u64; // arg 0: worker index
+        *(args.add(1)) = pool_idx as u64; // arg 1: thread pool index
+        *(args.add(2)) = 0; // fake return address (x86_64)
+        *(args.add(3)) = 0; // padding (16-byte alignment)
 
         let err = invoke::tcb_configure(
             tcb_slot,
@@ -683,15 +754,20 @@ unsafe fn rollback_worker(desc: *mut ThreadDesc) {
         if (*desc).ipc_frame_cap != 0 {
             invoke::cnode_delete(CAP_SELF_CSPACE, (*desc).ipc_frame_cap);
         }
+        if (*desc).tcb_cap != 0 {
+            slot_alloc::slot_free_range((*desc).tcb_cap, 3);
+        }
         if (*desc).stack_frame_base != 0 {
             for p in 0..(*desc).stack_frame_count {
                 invoke::cnode_delete(CAP_SELF_CSPACE, (*desc).stack_frame_base + p);
             }
+            slot_alloc::slot_free_range((*desc).stack_frame_base, (*desc).stack_frame_count);
         }
         if (*desc).tls_frame_base != 0 {
             for p in 0..(*desc).tls_frame_count {
                 invoke::cnode_delete(CAP_SELF_CSPACE, (*desc).tls_frame_base + p);
             }
+            slot_alloc::slot_free_range((*desc).tls_frame_base, (*desc).tls_frame_count);
         }
 
         (*desc).state.store(TD_UNUSED, Ordering::Release);
@@ -757,44 +833,146 @@ unsafe extern "C" fn worker_entry_helper(worker_idx: u64, pool_idx: u64) -> ! {
 unsafe fn worker_ipc_loop(worker_idx: usize) -> ! {
     unsafe {
         let cfg = &*(&raw const WORKER_CFG);
-        let endpoint = cfg.endpoint;
+        let endpoints = (&cfg.endpoints) as *const Cap;
+        let endpoint_count = cfg.endpoint_count;
         let handler = match cfg.handler {
             Some(h) => h,
             None => {
                 crate::serial::serial_puts(b"[WORKER] no handler configured\n");
-                loop { syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0); }
+                loop {
+                    syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+                }
             }
         };
+        let on_enter = cfg.on_enter;
+        let next_timeout_ns = cfg.next_timeout_ns;
+        let on_timeout = cfg.on_timeout;
 
         let ctx = crate::current_ipc_ctx();
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
         let mut badge: u64 = 0;
+        let mut recv_source: u64 = 0;
 
-        // First message: blocking recv
-        let err = ipc::recv_ctx(ctx, endpoint, &raw mut msg, &raw mut badge);
-        if err != 0 {
-            crate::serial::serial_puts(b"[WORKER] initial recv failed\n");
-            worker_exit(worker_idx);
+        if let Some(enter) = on_enter {
+            enter(ctx, worker_idx);
         }
 
         loop {
-            let cont = handler(ctx, &raw mut msg, badge, &raw mut reply);
+            let first_timeout_ns = match next_timeout_ns {
+                Some(f) => f(ctx, worker_idx),
+                None => 0,
+            };
+            let err = if first_timeout_ns == 0 {
+                ipc::recv_any_ctx(
+                    ctx,
+                    endpoints,
+                    endpoint_count,
+                    &raw mut msg,
+                    &raw mut badge,
+                    &raw mut recv_source,
+                )
+            } else {
+                ipc::recv_any_timed_ctx(
+                    ctx,
+                    endpoints,
+                    endpoint_count,
+                    first_timeout_ns,
+                    &raw mut msg,
+                    &raw mut badge,
+                    &raw mut recv_source,
+                )
+            };
+            if err == TRONA_CANCELLED as i32 || err == TRONA_TIMED_OUT as i32 {
+                if let Some(timeout_hook) = on_timeout {
+                    timeout_hook(ctx, worker_idx);
+                }
+                continue;
+            }
+            if err != 0 {
+                crate::serial::serial_puts(b"[WORKER] initial recv failed\n");
+                worker_exit(worker_idx);
+            }
+            break;
+        }
 
-            if !cont {
+        loop {
+            let control = handler(ctx, &raw mut msg, badge, recv_source, &raw mut reply);
+
+            if let WorkerLoopControl::Exit = control {
                 worker_exit(worker_idx);
             }
 
-            let err = ipc::reply_recv_ctx(
-                ctx,
-                endpoint,
-                &raw const reply,
-                &raw mut msg,
-                &raw mut badge,
-            );
+            let timeout_ns = match next_timeout_ns {
+                Some(f) => f(ctx, worker_idx),
+                None => 0,
+            };
+            let err = match control {
+                WorkerLoopControl::Reply => {
+                    if timeout_ns == 0 {
+                        ipc::reply_recv_any_ctx(
+                            ctx,
+                            endpoints,
+                            endpoint_count,
+                            &raw const reply,
+                            &raw mut msg,
+                            &raw mut badge,
+                            &raw mut recv_source,
+                        )
+                    } else {
+                        ipc::reply_recv_any_timed_ctx(
+                            ctx,
+                            endpoints,
+                            endpoint_count,
+                            timeout_ns,
+                            &raw const reply,
+                            &raw mut msg,
+                            &raw mut badge,
+                            &raw mut recv_source,
+                        )
+                    }
+                }
+                WorkerLoopControl::SkipReply => {
+                    if timeout_ns == 0 {
+                        ipc::recv_any_ctx(
+                            ctx,
+                            endpoints,
+                            endpoint_count,
+                            &raw mut msg,
+                            &raw mut badge,
+                            &raw mut recv_source,
+                        )
+                    } else {
+                        ipc::recv_any_timed_ctx(
+                            ctx,
+                            endpoints,
+                            endpoint_count,
+                            timeout_ns,
+                            &raw mut msg,
+                            &raw mut badge,
+                            &raw mut recv_source,
+                        )
+                    }
+                }
+                WorkerLoopControl::Exit => unreachable!(),
+            };
+
+            if err == TRONA_CANCELLED as i32 || err == TRONA_TIMED_OUT as i32 {
+                if let Some(timeout_hook) = on_timeout {
+                    timeout_hook(ctx, worker_idx);
+                }
+                continue;
+            }
             if err != 0 {
-                // reply_recv failed -- try plain recv to recover
-                let err2 = ipc::recv_ctx(ctx, endpoint, &raw mut msg, &raw mut badge);
+                // receive recovery failed
+                let err2 = ipc::recv_any_ctx(
+                    ctx,
+                    endpoints,
+                    endpoint_count,
+                    &raw mut msg,
+                    &raw mut badge,
+                    &raw mut recv_source,
+                );
                 if err2 != 0 {
                     crate::serial::serial_puts(b"[WORKER] recv recovery failed\n");
                     worker_exit(worker_idx);
@@ -806,6 +984,32 @@ unsafe fn worker_ipc_loop(worker_idx: usize) -> ! {
                 reap_exited_workers();
             }
         }
+    }
+}
+
+/// Return the worker slot index for the current thread, or 0 for the main thread.
+pub fn current_worker_index() -> usize {
+    unsafe {
+        let tls = match tls::current_tls() {
+            Some(t) => t,
+            None => return 0,
+        };
+        let desc = (*tls).desc;
+        if desc.is_null() {
+            return 0;
+        }
+        let mut idx = 0usize;
+        while idx < MAX_WORKERS {
+            let ws = &*(&raw const WORKER_SLOTS[idx]);
+            if ws.active {
+                let pool_desc = tls::thread_desc(ws.thread_pool_idx);
+                if pool_desc as *mut u8 == desc {
+                    return idx;
+                }
+            }
+            idx += 1;
+        }
+        0
     }
 }
 
@@ -835,13 +1039,8 @@ unsafe fn worker_exit(worker_idx: usize) -> ! {
 
         (*desc).state.store(TD_EXITED, Ordering::Release);
 
-        // Self-suspend -- reaper cleans up
-        let tcb = (*desc).tcb_cap;
-        invoke::tcb_suspend_retry(tcb, 4);
-
-        loop {
-            syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-        }
+        // Reaper cleans up after the current worker stops itself.
+        crate::syscall::thread_exit();
     }
 }
 
@@ -867,7 +1066,7 @@ fn reap_exited_workers() {
             {
                 // Ensure TCB is suspended before cleanup
                 if (*desc).tcb_cap != 0 {
-                    invoke::tcb_suspend_retry((*desc).tcb_cap, 4);
+                    invoke::tcb_suspend((*desc).tcb_cap);
                 }
 
                 tls::cleanup_thread(desc);

@@ -16,6 +16,8 @@ pe_rtld_c_args = [
     '-fno-plt',
     '-fno-stack-protector',
     '-I', meson.current_source_dir(),
+    # Generated `cap_table_roles.h` in the parent build directory.
+    '-I', rtld_generated_dir,
 ]
 
 # Step 1: Compile C source with depfile for header tracking
@@ -30,6 +32,7 @@ foreach src : pe_rtld_c_sources
     depfile: dep_name,
     command: [cc_cmd, pe_rtld_c_args, '-MMD', '-MF', '@DEPFILE@',
              '-c', '-o', '@OUTPUT@', '@INPUT@'],
+    depends: [role_map_gen],
     build_by_default: true,
   )
 endforeach

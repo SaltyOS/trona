@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! POSIX file operations (open, read, write, close, stat, lseek, access, unlink).
 
-use super::{pack_path, CAP_VFS_EP};
+use super::pack_path;
 use trona::consts::kernel::*;
 use trona::protocol::*;
 use trona::types::core::*;
@@ -16,14 +16,14 @@ pub unsafe fn posix_open(path: *const u8, flags: i32, mode: u32) -> i32 {
         let mode = mode & !super::misc::get_umask();
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_OPEN;
+        msg.label = VFS_POSIX_OPEN;
         msg.regs[0] = mode as u64;
         msg.regs[1] = flags as u32 as u64;
         let path_len = pack_path(&raw mut msg, 2, path, 128);
         msg.length = 3 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc_call_retry(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -69,7 +69,7 @@ pub unsafe fn posix_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
             msg.regs[0] = fd as u64;
             msg.regs[1] = chunk;
 
-            let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+            let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
             if err != 0 || reply.label != TRONA_OK {
                 if err == TRONA_INTERRUPTED as i32 {
                     if total > 0 {
@@ -138,7 +138,7 @@ pub unsafe fn posix_write(fd: i32, buf: *const u8, count: u64) -> i64 {
                 *dst.add(i) = *buf.add(total as usize + i);
             }
 
-            let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+            let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
             if err != 0 || reply.label != TRONA_OK {
                 if err == TRONA_INTERRUPTED as i32 {
                     if total > 0 {
@@ -201,7 +201,7 @@ pub unsafe fn posix_pread(fd: i32, buf: *mut u8, count: u64, offset: i64) -> i64
             msg.regs[2] = cur_off;
 
             let err = crate::ipc_call_retry_idempotent(
-                CAP_VFS_EP,
+                trona::caps::vfs_ep(),
                 &raw const msg,
                 &raw mut reply,
             );
@@ -281,7 +281,7 @@ pub unsafe fn posix_pwrite(fd: i32, buf: *const u8, count: u64, offset: i64) -> 
             }
 
             let err = crate::ipc_call_retry_idempotent(
-                CAP_VFS_EP,
+                trona::caps::vfs_ep(),
                 &raw const msg,
                 &raw mut reply,
             );
@@ -317,7 +317,7 @@ pub unsafe fn posix_close(fd: i32) -> i32 {
         msg.regs[0] = fd as u64;
 
         let err = crate::ipc_call_retry(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -337,12 +337,12 @@ pub unsafe fn posix_stat(path: *const u8, st: *mut TronaStat) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_STAT;
+        msg.label = VFS_POSIX_STAT;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -372,12 +372,12 @@ pub unsafe fn posix_lstat(path: *const u8, st: *mut TronaStat) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_LSTAT;
+        msg.label = VFS_POSIX_LSTAT;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -407,12 +407,12 @@ pub unsafe fn posix_fstat(fd: i32, st: *mut TronaStat) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_FSTAT;
+        msg.label = VFS_POSIX_FSTAT;
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -450,7 +450,7 @@ pub unsafe fn posix_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
         msg.regs[2] = whence as u64;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -470,13 +470,13 @@ pub unsafe fn posix_access(path: *const u8, mode: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_ACCESS;
+        msg.label = VFS_POSIX_ACCESS;
         let path_len = pack_path(&raw mut msg, 1, path, 128);
         msg.regs[0] = mode as u64;
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -495,12 +495,12 @@ pub unsafe fn posix_unlink(path: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_UNLINK;
+        msg.label = VFS_POSIX_UNLINK;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc_call_retry(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -522,7 +522,7 @@ pub unsafe fn posix_rename(old_path: *const u8, new_path: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_RENAME;
+        msg.label = VFS_POSIX_RENAME;
 
         let mut old_len: u8 = 0;
         while *old_path.add(old_len as usize) != 0 && old_len < 64 {
@@ -549,7 +549,7 @@ pub unsafe fn posix_rename(old_path: *const u8, new_path: *const u8) -> i32 {
         msg.length = 2 + ((old_len as u64 + 7) / 8) + ((new_len as u64 + 7) / 8);
 
         let err = crate::ipc_call_retry(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -570,13 +570,13 @@ pub unsafe fn posix_mkdir(path: *const u8, mode: i32) -> i32 {
         let mode = (mode as u32) & !super::misc::get_umask();
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_MKDIR;
+        msg.label = VFS_POSIX_MKDIR;
         let path_len = pack_path(&raw mut msg, 1, path, 128);
         msg.regs[0] = mode as u64;
         msg.length = 2 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc_call_retry(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -595,12 +595,12 @@ pub unsafe fn posix_rmdir(path: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_RMDIR;
+        msg.label = VFS_POSIX_RMDIR;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc_call_retry(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -619,12 +619,12 @@ pub unsafe fn posix_opendir(path: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_OPENDIR;
+        msg.label = VFS_POSIX_OPENDIR;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
         let err = crate::ipc_call_retry(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -646,12 +646,12 @@ pub unsafe fn posix_readdir(dir_fd: i32, entry: *mut TronaDirent) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_READDIR;
+        msg.label = VFS_POSIX_READDIR;
         msg.length = 1;
         msg.regs[0] = dir_fd as u64;
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -689,13 +689,13 @@ pub unsafe fn posix_ftruncate(fd: i32, length: u64) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_FTRUNCATE;
+        msg.label = VFS_POSIX_FTRUNCATE;
         msg.length = 2;
         msg.regs[0] = fd as u64;
         msg.regs[1] = length;
 
         let err = crate::ipc_call_retry(
-            CAP_VFS_EP,
+            trona::caps::vfs_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -719,6 +719,31 @@ pub unsafe fn posix_symlink(target: *const u8, linkpath: *const u8) -> i32 {
 /// Returns the number of bytes placed in `buf`, or -1 on error.
 pub unsafe fn posix_readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
     unsafe { super::at::posix_readlinkat(-100, path, buf, bufsiz) }
+}
+
+/// Sync a file descriptor's data to persistent storage.
+/// Returns 0 on success, negative errno on error.
+pub unsafe fn posix_fsync(fd: i32) -> i32 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = VFS_FSYNC;
+        msg.length = 1;
+        msg.regs[0] = fd as u64;
+
+        let err = crate::ipc_call_retry(
+            trona::caps::vfs_ep(),
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 {
+            return super::call_err_to_posix(err);
+        }
+        if reply.label != TRONA_OK {
+            return super::trona_err_to_posix(reply.label);
+        }
+        0
+    }
 }
 
 /// Create a hard link: `newpath` becomes an additional name for `oldpath`.

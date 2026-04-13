@@ -9,8 +9,18 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
+use crate::consts::server::{CSPACE_EXPAND_BASE, MAX_CSPACE_EXPANSIONS};
+use crate::types::TronaCspaceLayoutV1;
+
 /// Number of 4K stack pages allocated per child process (default 128 KiB stack).
 pub const CHILD_STACK_PAGES: usize = 32;
+/// Number of CSpace slots reserved at the top of a Pager / BootstrapAuthority
+/// CNode for incoming cap_transfers (page-fault VSpace caps, RES_ADOPT_UNTYPED,
+/// etc.). Sized generously because these are the only userland services that
+/// receive raw caps in bulk.
+pub const AUTHORITY_RECV_SLOT_COUNT: u64 = 1024;
+/// Minimum child slot reserved for RTLD frame allocation.
+pub const CHILD_FRAME_SLOT_BASE: u64 = 64;
 
 // ---- Default VA addresses (private to layout computation) ----
 // These define the canonical user address space layout within the first
@@ -19,15 +29,112 @@ pub const CHILD_STACK_PAGES: usize = 32;
 pub const IPC_BUF_BASE: u64 = 0x0000_0000_0020_0000;
 const ELF_CODE_BASE: u64 = 0x0000_0000_0021_0000;
 const DEFAULT_STACK_BASE: u64 = 0x0000_0000_003F_8000;
-const DEFAULT_SCRATCH_BASE: u64 = 0x0000_0000_003F_F000;
 const DEFAULT_STACK_TOP: u64 = DEFAULT_STACK_BASE + (CHILD_STACK_PAGES as u64) * 0x1000;
+const DEFAULT_SCRATCH_BASE: u64 = DEFAULT_STACK_TOP;
 const INITRD_BASE: u64 = 0x0000_0000_0100_0000;
 /// Gap between existing mapped regions and the start of mmap allocations.
 const MMAP_BASE_GAP: u64 = 0x1000_0000; // 256 MiB
 
 // Second 2MiB window for stack relocation
 const WINDOW2_STACK_BASE: u64 = 0x0000_0000_007F_8000;
-const WINDOW2_SCRATCH_BASE: u64 = 0x0000_0000_007F_F000;
+const WINDOW2_STACK_TOP: u64 = WINDOW2_STACK_BASE + (CHILD_STACK_PAGES as u64) * 0x1000;
+const WINDOW2_SCRATCH_BASE: u64 = WINDOW2_STACK_TOP;
+
+/// Policy profile for child CSpace layout computation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CspaceLayoutProfile {
+    DefaultService,
+    Pager,
+    BootstrapAuthority,
+}
+
+/// Compute the child CSpace layout contract.
+///
+/// `frame_slot_floor` is the first slot that must remain available for RTLD
+/// frame allocation after fixed/service-injected slots. The returned
+/// descriptor uses half-open ranges throughout.
+pub fn compute_cspace_layout(
+    cnode_bits: u64,
+    frame_slot_floor: u64,
+    profile: CspaceLayoutProfile,
+    has_expand_window: bool,
+) -> TronaCspaceLayoutV1 {
+    let total_slots = if cnode_bits >= 63 {
+        0
+    } else {
+        1u64 << cnode_bits
+    };
+
+    let frame_slot_base = if frame_slot_floor > CHILD_FRAME_SLOT_BASE {
+        frame_slot_floor
+    } else {
+        CHILD_FRAME_SLOT_BASE
+    };
+
+    let (recv_base, recv_limit) = if (profile == CspaceLayoutProfile::Pager
+        || profile == CspaceLayoutProfile::BootstrapAuthority)
+        && total_slots != 0
+    {
+        let reserve = if total_slots > AUTHORITY_RECV_SLOT_COUNT {
+            AUTHORITY_RECV_SLOT_COUNT
+        } else {
+            total_slots
+        };
+        (total_slots.saturating_sub(reserve), total_slots)
+    } else {
+        (0, 0)
+    };
+
+    let (expand_base, expand_limit) = if has_expand_window {
+        let base = if total_slots > CSPACE_EXPAND_BASE {
+            CSPACE_EXPAND_BASE
+        } else {
+            total_slots
+        };
+        let limit = {
+            let requested = CSPACE_EXPAND_BASE + MAX_CSPACE_EXPANSIONS as u64;
+            if total_slots < requested { total_slots } else { requested }
+        };
+        if limit > base { (base, limit) } else { (0, 0) }
+    } else {
+        (0, 0)
+    };
+
+    let mut alloc_limit = total_slots;
+    if expand_limit > expand_base && expand_base < alloc_limit {
+        alloc_limit = expand_base;
+    }
+    if recv_limit > recv_base && recv_base < alloc_limit {
+        alloc_limit = recv_base;
+    }
+
+    let alloc_base = if frame_slot_base < alloc_limit {
+        frame_slot_base
+    } else {
+        alloc_limit
+    };
+
+    let mut flags = 0u64;
+    if recv_limit > recv_base {
+        flags |= TronaCspaceLayoutV1::FLAG_HAS_RECV_RANGE;
+    }
+    if expand_limit > expand_base {
+        flags |= TronaCspaceLayoutV1::FLAG_HAS_EXPAND_RANGE;
+    }
+
+    TronaCspaceLayoutV1 {
+        version: TronaCspaceLayoutV1::VERSION,
+        flags,
+        cnode_bits,
+        frame_slot_base,
+        alloc_base,
+        alloc_limit,
+        recv_base,
+        recv_limit,
+        expand_base,
+        expand_limit,
+    }
+}
 
 /// A contiguous page-aligned region in the child's virtual address space.
 #[derive(Clone, Copy)]
@@ -209,7 +316,7 @@ pub fn compute_vm_layout(
         (
             stk,
             VmRegion { base: WINDOW2_SCRATCH_BASE, size: 0x1000 },
-            WINDOW2_STACK_BASE + stack_size,
+            WINDOW2_STACK_TOP,
         )
     } else {
         // Large binary: place stack/scratch dynamically above code region
@@ -310,14 +417,14 @@ pub fn compute_vm_layout_randomized(
         let sbase = DEFAULT_STACK_BASE - stack_slide;
         (
             VmRegion { base: sbase, size: stack_size },
-            VmRegion { base: DEFAULT_SCRATCH_BASE, size: 0x1000 },
+            VmRegion { base: sbase + stack_size, size: 0x1000 },
             sbase + stack_size,
         )
     } else if code_end <= WINDOW2_STACK_BASE.saturating_sub(stack_slide) {
         let sbase = WINDOW2_STACK_BASE - stack_slide;
         (
             VmRegion { base: sbase, size: stack_size },
-            VmRegion { base: WINDOW2_SCRATCH_BASE, size: 0x1000 },
+            VmRegion { base: sbase + stack_size, size: 0x1000 },
             sbase + stack_size,
         )
     } else {

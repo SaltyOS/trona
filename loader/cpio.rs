@@ -251,11 +251,95 @@ pub unsafe fn cpio_next_ext(
         (*entry).data_len = filesize;
         (*entry).ino = parse_hex8(header.add(6)) as u32;
         (*entry).mode = parse_hex8(header.add(14)) as u32;
+        (*entry).uid = parse_hex8(header.add(22)) as u32;
+        (*entry).gid = parse_hex8(header.add(30)) as u32;
         (*entry).nlink = parse_hex8(header.add(38)) as u32;
         (*entry).mtime = parse_hex8(header.add(46)) as u32;
         *offset = align4(data_end);
     }
     1
+}
+
+/// Search for a file by name in a CPIO archive, returning extended metadata.
+///
+/// Like `cpio_find_file`, but populates a `CpioEntryExt` with inode, mode,
+/// uid, gid, nlink, and mtime fields from the CPIO header. Returns 1 if
+/// found, 0 otherwise.
+///
+/// # Safety
+/// `archive` must point to a valid CPIO archive of at least `archive_len`
+/// bytes. `name` must be valid for `name_len` bytes.
+pub unsafe fn cpio_find_file_ext(
+    archive: *const u8,
+    archive_len: usize,
+    name: *const u8,
+    name_len: usize,
+    entry: *mut CpioEntryExt,
+) -> i32 {
+    let mut offset: usize = 0;
+
+    loop {
+        if offset + CPIO_HEADER_SIZE > archive_len {
+            return 0;
+        }
+
+        let header = unsafe { archive.add(offset) };
+
+        if !check_magic(header) {
+            return 0;
+        }
+
+        let namesize = parse_hex8(unsafe { header.add(94) });
+        let filesize = parse_hex8(unsafe { header.add(54) });
+
+        let name_start = offset + CPIO_HEADER_SIZE;
+        if name_start + namesize > archive_len {
+            return 0;
+        }
+
+        let entry_name = unsafe { archive.add(name_start) };
+        let mut entry_name_len = namesize;
+        if entry_name_len > 0 && unsafe { *entry_name.add(entry_name_len - 1) } == 0 {
+            entry_name_len -= 1;
+        }
+
+        if is_trailer(entry_name, entry_name_len) {
+            return 0;
+        }
+
+        let data_start = align4(offset + CPIO_HEADER_SIZE + namesize);
+        let data_end = data_start + filesize;
+        if data_end > archive_len {
+            return 0;
+        }
+
+        if entry_name_len == name_len {
+            let mut match_found = true;
+            for i in 0..entry_name_len {
+                if unsafe { *entry_name.add(i) } != unsafe { *name.add(i) } {
+                    match_found = false;
+                    break;
+                }
+            }
+            if match_found {
+                unsafe {
+                    (*entry).name = entry_name;
+                    (*entry).name_len = entry_name_len;
+                    (*entry).data = archive.add(data_start);
+                    (*entry).data_len = filesize;
+                    (*entry).ino = parse_hex8(header.add(6)) as u32;
+                    (*entry).mode = parse_hex8(header.add(14)) as u32;
+                    (*entry).uid = parse_hex8(header.add(22)) as u32;
+                    (*entry).gid = parse_hex8(header.add(30)) as u32;
+                    (*entry).nlink = parse_hex8(header.add(38)) as u32;
+                    (*entry).mtime = parse_hex8(header.add(46)) as u32;
+                }
+                return 1;
+            }
+        }
+
+        offset = align4(data_end);
+    }
 }
 
 /// Compute the total size of a CPIO archive (up to the TRAILER sentinel).

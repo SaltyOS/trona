@@ -16,8 +16,6 @@ use crate::tls;
 use trona::types::core::*;
 use trona::types::posix::*;
 
-const CAP_SELF_CSPACE: u64 = 2;
-
 /// Cached dnssrv endpoint resolved lazily through namesrv.
 static mut DNSSRV_EP: Cap = 0;
 /// Dedicated receive slot reused for dnssrv endpoint lookup.
@@ -58,7 +56,7 @@ unsafe fn resolve_dnssrv_ep() -> Result<Cap, u64> {
         ::core::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
 
         let err = crate::ipc_call_retry_idempotent(
-            CAP_NAMESRV_EP,
+            trona::caps::namesrv_ep(),
             &raw const msg,
             &raw mut reply,
         );

@@ -69,6 +69,12 @@ pub const SALTYFS_SYMLINK: u64 = 17;
 pub const SALTYFS_READLINK: u64 = 18;
 pub const SALTYFS_LINK: u64 = 19;
 pub const SALTYFS_GETPARENT: u64 = 20;
+pub const SALTYFS_CHMOD: u64 = 21;
+pub const SALTYFS_CHOWN: u64 = 22;
+pub const SALTYFS_GETXATTR: u64 = 23;
+pub const SALTYFS_SETXATTR: u64 = 24;
+pub const SALTYFS_REMOVEXATTR: u64 = 25;
+pub const SALTYFS_LISTXATTR: u64 = 26;
 
 /// Network stack IPC labels (netsrv protocol).
 pub const NET_SOCKET: u64 = 0xA0;
