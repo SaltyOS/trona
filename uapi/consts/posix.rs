@@ -8,6 +8,7 @@ pub const O_RDWR: u32 = 0x0002;
 pub const O_ACCMODE: u32 = 0x0003;
 pub const O_CREAT: u32 = 0x0040;
 pub const O_EXCL: u32 = 0x0080;
+pub const O_NOCTTY: u32 = 0x0100;
 pub const O_TRUNC: u32 = 0x0200;
 pub const O_APPEND: u32 = 0x0400;
 pub const O_NONBLOCK: u32 = 0x0800;
@@ -27,9 +28,32 @@ pub const S_IFSOCK: u64 = 0o140000;
 pub const S_IFIFO: u64 = 0o010000;
 pub const S_IFLNK: u64 = 0o120000;
 
+// Permission bits
+pub const S_ISUID: u32 = 0o4000;
+pub const S_ISGID: u32 = 0o2000;
+pub const S_ISVTX: u32 = 0o1000;
+
+pub const S_IRWXU: u32 = 0o700;
+pub const S_IRUSR: u32 = 0o400;
+pub const S_IWUSR: u32 = 0o200;
+pub const S_IXUSR: u32 = 0o100;
+pub const S_IRWXG: u32 = 0o070;
+pub const S_IRGRP: u32 = 0o040;
+pub const S_IWGRP: u32 = 0o020;
+pub const S_IXGRP: u32 = 0o010;
+pub const S_IRWXO: u32 = 0o007;
+pub const S_IROTH: u32 = 0o004;
+pub const S_IWOTH: u32 = 0o002;
+pub const S_IXOTH: u32 = 0o001;
+
+// Supplementary group limit
+pub const NGROUPS_MAX: usize = 32;
+
 // Access mode flags
 pub const F_OK: u64 = 0;
 pub const R_OK: u64 = 4;
+pub const W_OK: u64 = 2;
+pub const X_OK: u64 = 1;
 
 // Directory entry types
 pub const DT_UNKNOWN: u8 = 0;
@@ -138,7 +162,10 @@ pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
 pub const TIOCSCTTY: u64 = 0x540E;
 pub const TIOCGWINSZ: u64 = 0x5413;
+pub const TIOCSWINSZ: u64 = 0x5414;
 pub const TIOCNOTTY: u64 = 0x5422;
+pub const TIOCGSID: u64 = 0x5429;
+pub const TIOCGPTN: u64 = 0x80045430;
 
 // Framebuffer ioctl requests
 pub const FBIOGET_VSCREENINFO: u64 = 0x4600;
@@ -171,3 +198,28 @@ pub const DEV_ZERO: u8 = 2;
 pub const DEV_FB0: u8 = 3;
 pub const DEV_PTY_SLAVE: u8 = 4;
 pub const DEV_PTMX: u8 = 5;
+pub const DEV_URANDOM: u8 = 6;
+
+/// Synthetic device ids used for terminal identity across procfs and libc.
+pub const TTY_DEV_CONSOLE: u64 = 1;
+pub const TTY_DEV_PTS_BASE: u64 = 0x1000;
+
+pub const fn tty_dev_for_console() -> u64 {
+    TTY_DEV_CONSOLE
+}
+
+pub const fn tty_dev_for_pts(pty_id: u64) -> u64 {
+    TTY_DEV_PTS_BASE + pty_id
+}
+
+// Resource limits
+pub const RLIMIT_NOFILE: u32 = 0;
+pub const RLIMIT_NPROC: u32 = 1;
+pub const RLIMIT_AS: u32 = 2;
+pub const RLIMIT_FSIZE: u32 = 3;
+pub const RLIMIT_STACK: u32 = 4;
+pub const RLIMIT_CPU: u32 = 5;
+pub const RLIMIT_CORE: u32 = 6;
+pub const RLIMIT_DATA: u32 = 7;
+pub const RLIM_NLIMITS: usize = 8;
+pub const RLIM_INFINITY: u64 = u64::MAX;

@@ -23,5 +23,5 @@ pub const POSIX_TTYSRV_PTY_MASTER_WRITE: u64 = 20;
 pub const POSIX_TTYSRV_CLIENT_EXIT: u64 = 21;
 
 /// POSIX-only VFS labels (terminal, fcntl — not part of core VFS protocol).
-pub const VFS_ISATTY: u64 = 34;
-pub const VFS_FCNTL: u64 = 35;
+pub const VFS_POSIX_ISATTY: u64 = 34;
+pub const VFS_POSIX_FCNTL: u64 = 35;

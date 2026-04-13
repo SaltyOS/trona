@@ -30,7 +30,7 @@ pub struct TronaResult {
 pub struct TronaMsg {
     pub label: u64,
     pub length: u64,
-    pub regs: [u64; 20],
+    pub regs: [u64; 32],
 }
 
 impl TronaMsg {
@@ -39,13 +39,13 @@ impl TronaMsg {
         TronaMsg {
             label: 0,
             length: 0,
-            regs: [0; 20],
+            regs: [0; 32],
         }
     }
 }
 
 /// Number of u64 words in the IPC buffer's reserved payload area.
-pub const IPC_BUFFER_RESERVED_WORDS: usize = 478;
+pub const IPC_BUFFER_RESERVED_WORDS: usize = 465;
 /// Number of bytes in the IPC buffer's reserved payload area.
 pub const IPC_BUFFER_RESERVED_BYTES: usize = IPC_BUFFER_RESERVED_WORDS * core::mem::size_of::<u64>();
 
@@ -56,20 +56,23 @@ pub const IPC_BUFFER_RESERVED_BYTES: usize = IPC_BUFFER_RESERVED_WORDS * core::m
 /// capability transfer slots, and receive-slot configuration.
 ///
 /// - `msg[0..5]`: mirrors TronaMsg header (label, length, regs[0..3])
-/// - `msg[6..21]`: overflow message registers (regs[4..19])
+/// - `msg[6..33]`: overflow message registers (regs[4..31])
 /// - `badge`: sender badge written by kernel on receive
 /// - `caps[0..3]`: CNode slots of capabilities to transfer on send
 /// - `receive_cnode/index/depth`: destination for received capabilities
 /// - `reserved[0..]`: syscall-specific extended payload area.
-///   `VSPACE_WALK` writes tuples at word offset 30.
+///   `VSPACE_WALK` writes tuples at word offset 42.
 #[repr(C)]
 pub struct IpcBuffer {
-    pub msg: [u64; 22],
+    pub msg: [u64; 34],
     pub badge: u64,
     pub caps: [u64; 4],
     pub receive_cnode: u64,
     pub receive_index: u64,
     pub receive_depth: u64,
+    /// Timeout in nanoseconds for timed IPC operations (SendTimed, etc.).
+    /// Written by userland before the syscall; read by the kernel.
+    pub timeout_ns: u64,
     pub reserved: [u64; IPC_BUFFER_RESERVED_WORDS],
 }
 
@@ -91,6 +94,346 @@ impl IpcContext {
         IpcContext {
             ipc_buffer: core::ptr::null_mut(),
             send_cap_count: 0,
+        }
+    }
+}
+
+/// Child CSpace layout contract passed through auxv.
+///
+/// Producers (init/procmgr) compute the usable slot ranges for the child and
+/// place a pointer to this structure in `AT_TRONA_CSPACE_LAYOUT`. Consumers
+/// (rtld/CRT/userland) must treat the half-open ranges as the source of truth:
+/// `[alloc_base, alloc_limit)`, `[recv_base, recv_limit)`, and
+/// `[expand_base, expand_limit)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TronaCspaceLayoutV1 {
+    pub version: u64,
+    pub flags: u64,
+    pub cnode_bits: u64,
+    pub frame_slot_base: u64,
+    pub alloc_base: u64,
+    pub alloc_limit: u64,
+    pub recv_base: u64,
+    pub recv_limit: u64,
+    pub expand_base: u64,
+    pub expand_limit: u64,
+}
+
+impl TronaCspaceLayoutV1 {
+    pub const VERSION: u64 = 1;
+    pub const FLAG_HAS_RECV_RANGE: u64 = 1 << 0;
+    pub const FLAG_HAS_EXPAND_RANGE: u64 = 1 << 1;
+
+    pub const fn zeroed() -> Self {
+        TronaCspaceLayoutV1 {
+            version: 0,
+            flags: 0,
+            cnode_bits: 0,
+            frame_slot_base: 0,
+            alloc_base: 0,
+            alloc_limit: 0,
+            recv_base: 0,
+            recv_limit: 0,
+            expand_base: 0,
+            expand_limit: 0,
+        }
+    }
+
+    pub const fn alloc_count(&self) -> u64 {
+        if self.alloc_limit > self.alloc_base {
+            self.alloc_limit - self.alloc_base
+        } else {
+            0
+        }
+    }
+
+    pub const fn recv_count(&self) -> u64 {
+        if self.recv_limit > self.recv_base {
+            self.recv_limit - self.recv_base
+        } else {
+            0
+        }
+    }
+
+    pub const fn has_recv_range(&self) -> bool {
+        self.recv_limit > self.recv_base
+    }
+
+    pub const fn has_expand_range(&self) -> bool {
+        self.expand_limit > self.expand_base
+    }
+}
+
+/// Startup capability table entry — one row per cap delivered to the child.
+///
+/// `role_id` is drawn from the `ROLE_*` constants in `consts/kernel.rs` and
+/// tells the consumer which semantic role this slot fulfils. `slot` is the
+/// child-cspace slot number where the spawner has placed the cap. `rights`
+/// and `flags` are advisory hints about the cap shape (see `CAP_TBL_RIGHT_*`
+/// / `CAP_TBL_FLAG_*`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TronaCapEntryV1 {
+    pub role_id: u32,
+    pub slot: u32,
+    pub rights: u32,
+    pub flags: u32,
+}
+
+impl TronaCapEntryV1 {
+    pub const fn zeroed() -> Self {
+        TronaCapEntryV1 {
+            role_id: 0,
+            slot: 0,
+            rights: 0,
+            flags: 0,
+        }
+    }
+}
+
+/// Startup capability table — single point of cap delivery from spawner to
+/// child, referenced via `AT_TRONA_CAP_TABLE`.
+///
+/// Layout: fixed 16-byte header followed by `count` flexible entries. The
+/// table is written into a spawner-side scratch page that is mapped into the
+/// child's VA; the child reads it once at startup to populate weak symbol
+/// slots (for system roles) and per-service `svc_caps::*` slots (for
+/// service-local roles).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TronaCapTableV1 {
+    pub magic: u32,
+    pub version: u32,
+    pub count: u32,
+    pub reserved: u32,
+    /// Flexible array — real length is `count`. Reached via pointer
+    /// arithmetic from the end of this header.
+    pub entries: [TronaCapEntryV1; 0],
+}
+
+impl TronaCapTableV1 {
+    pub const fn zeroed() -> Self {
+        TronaCapTableV1 {
+            magic: 0,
+            version: 0,
+            count: 0,
+            reserved: 0,
+            entries: [],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `Require=` entry — wire shape for PM_SPAWN requires payload.
+// ---------------------------------------------------------------------------
+
+/// Maximum length of a provider service name in a `Require=` entry.
+/// Must equal `ini::MAX_SERVICE_NAME` (currently 32).
+pub const MAX_REQUIRE_PROVIDER: usize = 32;
+
+/// Maximum length of a service-local alias / system attribute suffix.
+pub const MAX_REQUIRE_ALIAS: usize = 24;
+
+/// Maximum number of `Require=` entries per service.
+pub const MAX_REQUIRES: usize = 8;
+
+/// `TronaRequireDefV1.kind` — system role recognised by name.
+pub const REQUIRE_KIND_SYSTEM: u8 = 0;
+/// `TronaRequireDefV1.kind` — service-local role hashed via djb2.
+pub const REQUIRE_KIND_LOCAL: u8 = 1;
+
+/// Parsed `Require=` entry in its parser-side shape.
+///
+/// Used by init's `.service` parser to hold a fully resolved `Require=`
+/// entry. The fields cover everything the parser sees: `provider`, `alias`,
+/// `kind`, `badged`, `raw`, and the pre-resolved `role_id`.
+///
+/// This struct is **not** the on-wire shape shipped to procmgr — see
+/// `TronaProcmgrRequireV1` (40 B) for that. The wire form drops `alias`
+/// because procmgr only ever needs `role_id` (already resolved at parse
+/// time) and `provider` (for provider-registry lookup). The build-time
+/// `tools/svc_caps_gen.py` generator also reads the parser-side shape —
+/// that's why `alias` is kept here.
+///
+/// Semantics:
+///
+/// | field          | meaning                                         |
+/// |----------------|-------------------------------------------------|
+/// | `provider`     | Service name or system short name (NUL-padded). |
+/// | `provider_len` | Valid length of `provider`.                     |
+/// | `alias`        | System attribute suffix (e.g. `authority_raw`)  |
+/// |                | or service-local alias.                          |
+/// | `alias_len`    | Valid length of `alias`.                        |
+/// | `kind`         | `REQUIRE_KIND_SYSTEM` / `REQUIRE_KIND_LOCAL`.   |
+/// | `badged`       | 0/1 — spawner mints a badged copy.              |
+/// | `raw`          | 0/1 — privileged raw cap (requires bootstrap    |
+/// |                | privilege on the consumer).                      |
+/// | `role_id`      | Pre-resolved `ROLE_*` id (system) or djb2 hash  |
+/// |                | mod `LOCAL_ROLE_MOD + LOCAL_ROLE_BASE` (local). |
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TronaRequireDefV1 {
+    pub provider: [u8; MAX_REQUIRE_PROVIDER],
+    pub provider_len: u8,
+    pub alias: [u8; MAX_REQUIRE_ALIAS],
+    pub alias_len: u8,
+    pub kind: u8,
+    pub badged: u8,
+    pub raw: u8,
+    pub _pad: u8,
+    pub role_id: u32,
+}
+
+impl TronaRequireDefV1 {
+    pub const fn zeroed() -> Self {
+        TronaRequireDefV1 {
+            provider: [0; MAX_REQUIRE_PROVIDER],
+            provider_len: 0,
+            alias: [0; MAX_REQUIRE_ALIAS],
+            alias_len: 0,
+            kind: REQUIRE_KIND_SYSTEM,
+            badged: 0,
+            raw: 0,
+            _pad: 0,
+            role_id: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Procmgr service-def registry — wire shape for `PM_REGISTER_SERVICE_DEFS`.
+// ---------------------------------------------------------------------------
+//
+// Init parses every `.service` file in the initrd and resolves each
+// `Require=` entry into a `TronaRequireDefV1`. The `alias` field is only
+// needed by init's parser and the build-time `svc_caps_gen.py` generator —
+// procmgr only ever needs the *resolved* `role_id` plus the `provider`
+// service name. We therefore ship a *narrower* shape to procmgr that drops
+// `alias`/`alias_len`/`_pad`, shrinking each entry from 68 to 40 bytes.
+//
+// The whole registry must fit in a single 4 KiB frame so the transfer is
+// one IPC call with one cap. With `MAX_PROCMGR_REQUIRES = 6`:
+//
+//   header                  16 bytes
+//   per-service def        276 bytes  (36 fixed + 6 * 40)
+//   capacity (4096 - 16) / 276 = 14 entries
+//
+// Post-procmgr services in the current image: 12. Two slots of headroom.
+
+/// Maximum number of `Require=` entries shipped to procmgr per service.
+///
+/// Smaller than `MAX_REQUIRES` (8) on purpose: the parser-side shape lives
+/// in init's stack frames where 8 is comfortable, but the registry shipped
+/// to procmgr must fit alongside ~12 service defs in one frame. Init must
+/// reject any post-procmgr service with more than this many `Require=`
+/// entries at serialization time.
+pub const MAX_PROCMGR_REQUIRES: usize = 6;
+
+/// Maximum number of service defs procmgr accepts in its registry.
+///
+/// Sized so that `header + MAX_PROCMGR_SERVICE_DEFS * sizeof(def)` fits in
+/// one 4 KiB frame: `16 + 14 * 276 = 3880 ≤ 4096`.
+pub const MAX_PROCMGR_SERVICE_DEFS: usize = 14;
+
+/// Magic for `TronaProcmgrServiceDefsV1`. Distinct from
+/// `TRONA_CAP_TABLE_MAGIC` so a malformed transfer cannot be misread as a
+/// cap table. Bytes spell `"PMSD"` little-endian.
+pub const TRONA_PROCMGR_DEFS_MAGIC: u32 = 0x44534D50;
+
+/// Wire version for `TronaProcmgrServiceDefsV1`. Bumped on incompatible
+/// layout changes (field add/remove/reorder). Procmgr rejects mismatches.
+pub const TRONA_PROCMGR_DEFS_VERSION: u32 = 1;
+
+/// One `Require=` entry as procmgr sees it.
+///
+/// Narrower than `TronaRequireDefV1`: the `alias` field is dropped because
+/// procmgr never needs it — `role_id` is pre-resolved by init, and provider
+/// lookup uses `provider` only. Layout is `#[repr(C)]` and naturally 4-byte
+/// aligned.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TronaProcmgrRequireV1 {
+    pub provider: [u8; MAX_REQUIRE_PROVIDER],
+    pub provider_len: u8,
+    pub kind: u8,
+    pub badged: u8,
+    pub raw: u8,
+    pub role_id: u32,
+}
+
+impl TronaProcmgrRequireV1 {
+    pub const fn zeroed() -> Self {
+        TronaProcmgrRequireV1 {
+            provider: [0; MAX_REQUIRE_PROVIDER],
+            provider_len: 0,
+            kind: REQUIRE_KIND_SYSTEM,
+            badged: 0,
+            raw: 0,
+            role_id: 0,
+        }
+    }
+}
+
+/// One service def as procmgr sees it.
+///
+/// `name` is the service name (also used as the spawn binary key by
+/// procmgr's provider registry). `bootstrap_privileged` gates
+/// `*_AUTHORITY_RAW` roles. `requires[..require_count]` is the resolved cap
+/// requirement list.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TronaProcmgrServiceDefV1 {
+    pub name: [u8; MAX_REQUIRE_PROVIDER],
+    pub name_len: u8,
+    pub bootstrap_privileged: u8,
+    pub require_count: u8,
+    pub _pad: u8,
+    pub requires: [TronaProcmgrRequireV1; MAX_PROCMGR_REQUIRES],
+}
+
+impl TronaProcmgrServiceDefV1 {
+    pub const fn zeroed() -> Self {
+        TronaProcmgrServiceDefV1 {
+            name: [0; MAX_REQUIRE_PROVIDER],
+            name_len: 0,
+            bootstrap_privileged: 0,
+            require_count: 0,
+            _pad: 0,
+            requires: [TronaProcmgrRequireV1::zeroed(); MAX_PROCMGR_REQUIRES],
+        }
+    }
+}
+
+/// Top-level header for the procmgr service-def registry.
+///
+/// Layout: 16-byte header followed by `count` `TronaProcmgrServiceDefV1`
+/// entries (flexible array). Init writes this into a single frame, maps it
+/// at a scratch VA, and transfers the frame cap to procmgr via
+/// `PM_REGISTER_SERVICE_DEFS`. Procmgr maps the frame at its own scratch
+/// VA, validates `magic` + `version`, copies the entries into a static
+/// array, then unmaps and acks.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TronaProcmgrServiceDefsV1 {
+    pub magic: u32,
+    pub version: u32,
+    pub count: u32,
+    pub reserved: u32,
+    /// Flexible array — real length is `count`, capped at
+    /// `MAX_PROCMGR_SERVICE_DEFS`. Reached via pointer arithmetic from the
+    /// end of this header.
+    pub entries: [TronaProcmgrServiceDefV1; 0],
+}
+
+impl TronaProcmgrServiceDefsV1 {
+    pub const fn zeroed() -> Self {
+        TronaProcmgrServiceDefsV1 {
+            magic: 0,
+            version: 0,
+            count: 0,
+            reserved: 0,
+            entries: [],
         }
     }
 }
@@ -217,8 +560,8 @@ impl CpioEntry {
     }
 }
 
-/// Extended CPIO archive entry: includes inode, mode, nlink, and mtime
-/// parsed from the CPIO newc header fields. Used by VFS to populate
+/// Extended CPIO archive entry: includes inode, mode, uid, gid, nlink, and
+/// mtime parsed from the CPIO newc header fields. Used by VFS to populate
 /// directory entries with proper metadata.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -228,6 +571,8 @@ pub struct CpioEntryExt {
     pub data: *const u8,
     pub data_len: usize,
     pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
     pub nlink: u32,
     pub mtime: u32,
     pub ino: u32,
@@ -241,6 +586,8 @@ impl CpioEntryExt {
             data: core::ptr::null(),
             data_len: 0,
             mode: 0,
+            uid: 0,
+            gid: 0,
             nlink: 0,
             mtime: 0,
             ino: 0,

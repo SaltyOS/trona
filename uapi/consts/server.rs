@@ -1,14 +1,12 @@
 // Server-level constants: well-known service caps, spawn policy, extended errors.
 // SPDX-License-Identifier: GPL-2.0-only
 
-/// Well-known service capability slot indices (set by procmgr for child processes).
-pub const CAP_PROCMGR_EP: u64 = 3;
-pub const CAP_VFS_EP: u64 = 4;
-pub const CAP_NAMESRV_EP: u64 = 5;
-pub const CAP_MMSRV_EP: u64 = 7;
-pub const CAP_COM1_IOPORT: u64 = 8;
-pub const CAP_CONSOLE_EP: u64 = 11;
-pub const CAP_PCI_IOPORT: u64 = 15;
+// Well-known capability slots are now spawner-private and delivered to each
+// child via `AT_TRONA_*` auxv tags. Lib code reads them at runtime through
+// the `trona::caps::*` getters; the spawner (init / procmgr) is free to
+// place each cap at any cursor-allocated slot. Only `CAP_UNTYPED_START`
+// remains here as a stable convention for the start of the procmgr-side
+// untyped slot range.
 pub const CAP_UNTYPED_START: u64 = 16;
 
 // Spawn readiness modes (bits [1:0] of spawn_policy)
@@ -68,6 +66,7 @@ pub const MMAP_BACKING_NONE: u64 = 0;
 pub const MMAP_BACKING_FILE: u64 = 1;
 pub const MMAP_BACKING_MOUNT: u64 = 2;
 pub const MMAP_BACKING_DEVICE: u64 = 3;
+pub const MMAP_BACKING_SHM: u64 = 4;
 
 pub const MMAP_OBJECT_OPT_LAZY: u64 = 1 << 0;
 pub const MMAP_OBJECT_OPT_WRITEBACK: u64 = 1 << 1;

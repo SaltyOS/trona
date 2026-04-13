@@ -33,6 +33,7 @@ pub const SYS_REPLY_RECV_ANY: u64 = 24;
 pub const SYS_RECV_ANY_TIMED: u64 = 25;
 pub const SYS_REPLY_RECV_ANY_TIMED: u64 = 26;
 pub const SYS_NOTIF_RETURN: u64 = 27;
+pub const SYS_THREAD_EXIT: u64 = 28;
 
 pub const IPC_RECV_SOURCE_NOTIFICATION: u64 = u64::MAX;
 
@@ -56,8 +57,9 @@ pub const CNODE_SAVE_CALLER: u64 = 0x16;
 pub const CNODE_SET_GUARD: u64 = 0x17;
 pub const CNODE_GET_INFO: u64 = 0x18;
 
-/// Untyped invoke label (0x20).
+/// Untyped invoke labels (0x20-0x21).
 pub const UNTYPED_RETYPE: u64 = 0x20;
+pub const UNTYPED_RESET: u64 = 0x21;
 
 /// SchedContext invoke labels (0x30-0x31).
 pub const SC_CONFIGURE: u64 = 0x30;
@@ -122,9 +124,8 @@ pub const MO_READ: u64 = 0x95;
 pub const MO_WRITE: u64 = 0x96;
 pub const MO_HAS_PAGE: u64 = 0x97;
 
-/// VSpace MemoryObject mapping invoke labels (0x97-0x9A).
+/// VSpace MemoryObject mapping invoke labels.
 pub const VSPACE_MAP_MO: u64 = 0x97;
-pub const VSPACE_UNMAP_MO: u64 = 0x98;
 pub const VSPACE_SHARE_RO_PAGE: u64 = 0x99;
 pub const VSPACE_FORK_RANGE: u64 = 0x9A;
 
@@ -145,7 +146,21 @@ pub const TRONA_CANCELLED: u64 = 12;
 pub const TRONA_RESTART: u64 = 13;
 pub const TRONA_DEADLOCK: u64 = 14;
 pub const TRONA_INTERRUPTED: u64 = 15;
+pub const TRONA_SLOT_OCCUPIED: u64 = 0x18;
+pub const TRONA_ALREADY_MAPPED: u64 = 0x19;
+pub const TRONA_ALREADY_BOUND: u64 = 0x1A;
 pub const TRONA_IN_PROGRESS: u64 = 0x10;
+pub const TRONA_TOO_LARGE: u64 = 0x11;
+pub const TRONA_NOT_SUPPORTED: u64 = 0x12;
+pub const TRONA_READONLY: u64 = 0x13;
+/// Filesystem: component is not a directory (walk through non-dir).
+pub const TRONA_NOT_DIRECTORY: u64 = 0x14;
+/// Filesystem: target is a directory where a non-directory was expected.
+pub const TRONA_IS_DIRECTORY: u64 = 0x15;
+/// Filesystem: symbolic link resolution exceeded depth limit.
+pub const TRONA_LOOP: u64 = 0x16;
+/// Filesystem / device: underlying I/O or backend failure.
+pub const TRONA_IO_ERROR: u64 = 0x17;
 pub const TRONA_PENDING: u64 = 0x80;
 
 /// VSpace page mapping flags.
@@ -183,14 +198,100 @@ pub const SCRATCH_VADDR: u64 = 0x0000_0000_0200_0000;
 pub const BOOTINFO_VADDR: u64 = 0x0000_0000_001F_F000;
 pub const BOOTINFO_MAGIC: u64 = 0x534C5459_424F4F54; // "SLTYBOOT"
 
-/// Userland slot allocator auxv types.
-pub const AT_TRONA_SLOT_BASE: u64 = 0x1007;
-pub const AT_TRONA_SLOT_COUNT: u64 = 0x1008;
+/// Userland CSpace layout auxv types.
+pub const AT_TRONA_CSPACE_LAYOUT: u64 = 0x1005;
 pub const AT_TRONA_CSPACE_NTFN: u64 = 0x100A;
-pub const AT_TRONA_MM_EP: u64 = 0x100B;
 pub const AT_TRONA_IPC_BUFFER: u64 = 0x100C;
 /// SchedContext capability slot for the main thread.
 pub const AT_TRONA_SC_CAP: u64 = 0x100E;
+
+/// Single auxv tag carrying the pointer to the child's startup capability
+/// table (`TronaCapTableV1`). Every role-bearing cap (procmgr control,
+/// vfs/namesrv/mmsrv clients, signal/readiness notifications, initrd/fb
+/// untypeds, PCI/COM1 ioports, ...) is delivered exclusively through this
+/// single tag — readers walk the table and look up caps by `ROLE_*`
+/// identifier. The legacy per-cap `AT_TRONA_*_EP` / `_NTFN` / `_UNTYPED`
+/// / `_IOPORT` tags that used to live in the 0x1010..0x101B range have
+/// been removed; the child cspace slot numbers they named are now free
+/// of any externally-observable ABI.
+pub const AT_TRONA_CAP_TABLE: u64 = 0x101C;
+
+/// Magic value at the start of a `TronaCapTableV1`: "SATC" in little-endian.
+pub const TRONA_CAP_TABLE_MAGIC: u32 = 0x43544153;
+
+/// Version field of a `TronaCapTableV1` understood by the current readers.
+pub const TRONA_CAP_TABLE_VERSION: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// Role identifiers for the startup capability table.
+//
+// Each entry in `TronaCapTableV1.entries[]` carries a `role_id` drawn from
+// the ranges below. Spawners (init/procmgr) populate entries; readers look
+// them up by role to discover the child-cspace slot where the matching cap
+// was placed.
+//
+// Range      Kind
+// 0x0001..   system roles (well-known, shared across all consumers)
+// 0x0080..   spawner-internal bridge roles (dual-emit period only)
+// 0x0100..   service-local roles (generated per `.service` Require=)
+// 0x1000..   reserved for future system roles
+// ---------------------------------------------------------------------------
+
+// System roles 0x0001..=0x00FF.
+pub const ROLE_PROCMGR_CONTROL: u32 = 0x0001;
+pub const ROLE_SERVICE_EP: u32 = 0x0002;
+pub const ROLE_NAMESRV_CLIENT: u32 = 0x0003;
+pub const ROLE_VFS_CLIENT: u32 = 0x0004;
+pub const ROLE_MMSRV_CLIENT: u32 = 0x0005;
+pub const ROLE_MMSRV_AUTHORITY_RAW: u32 = 0x0006;
+pub const ROLE_RSRCSRV_CLIENT: u32 = 0x0007;
+pub const ROLE_RSRCSRV_AUTHORITY_RAW: u32 = 0x0008;
+pub const ROLE_CONSOLE_CLIENT: u32 = 0x0009;
+pub const ROLE_SIGNAL_NTFN: u32 = 0x000A;
+pub const ROLE_READINESS_NTFN: u32 = 0x000B;
+pub const ROLE_INITRD_UNTYPED: u32 = 0x000C;
+pub const ROLE_FB_UNTYPED: u32 = 0x000D;
+pub const ROLE_PCI_IOPORT: u32 = 0x000E;
+pub const ROLE_COM1_IOPORT: u32 = 0x000F;
+pub const ROLE_WIN32SRV_CLIENT: u32 = 0x0010;
+pub const ROLE_CSPACE_NTFN: u32 = 0x0011;
+pub const ROLE_SC_CAP: u32 = 0x0012;
+
+// Spawner-internal bridge range 0x0080..=0x00FF — reserved for future
+// temporary bridge roles if a new spawner-only intermediate is ever
+// needed. The `ROLE_PROCMGR_EXPAND_EP` bridge used during the
+// transition away from `AT_TRONA_EXPAND_EP` has been removed — init
+// publishes its single expand/RPC slot directly as
+// `ROLE_PROCMGR_CONTROL`, and no consumer distinguished the two roles
+// while the bridge existed.
+
+// Service-local role range 0x0100..=0x0FFF (generator assigns via djb2).
+pub const LOCAL_ROLE_BASE: u32 = 0x0100;
+pub const LOCAL_ROLE_END: u32 = 0x0FFF;
+
+// ---------------------------------------------------------------------------
+// `TronaCapEntryV1.rights` bits — advisory; the actual kernel rights live in
+// the cap itself. Consumers may assert expected bits before invocation.
+// ---------------------------------------------------------------------------
+
+pub const CAP_TBL_RIGHT_READ: u32 = 1 << 0;
+pub const CAP_TBL_RIGHT_WRITE: u32 = 1 << 1;
+pub const CAP_TBL_RIGHT_GRANT: u32 = 1 << 2;
+pub const CAP_TBL_RIGHT_INVOKE: u32 = 1 << 3;
+pub const CAP_TBL_RIGHT_BADGE: u32 = 1 << 4;
+pub const CAP_TBL_RIGHT_DEVICE: u32 = 1 << 5;
+
+// ---------------------------------------------------------------------------
+// `TronaCapEntryV1.flags` bits — cap kind / delivery mode hints.
+// ---------------------------------------------------------------------------
+
+pub const CAP_TBL_FLAG_BADGED: u32 = 1 << 0;
+pub const CAP_TBL_FLAG_RAW: u32 = 1 << 1;
+pub const CAP_TBL_FLAG_OPTIONAL: u32 = 1 << 2;
+pub const CAP_TBL_FLAG_NOTIFICATION: u32 = 1 << 3;
+pub const CAP_TBL_FLAG_UNTYPED: u32 = 1 << 4;
+pub const CAP_TBL_FLAG_DEVICE_UT: u32 = 1 << 5;
+pub const CAP_TBL_FLAG_IO_PORT: u32 = 1 << 6;
 
 /// PE-specific auxv types (used by ld-trona-pe.so).
 pub const AT_SALTYOS_PE_BASE: u64 = 0x2000;
