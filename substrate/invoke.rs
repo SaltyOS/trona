@@ -11,6 +11,7 @@
 //! and returns the error code (0 = success).
 
 use crate::consts::*;
+use crate::slot_alloc;
 use crate::syscall::syscall;
 use crate::types::*;
 
@@ -27,6 +28,11 @@ pub fn invoke(cap: Cap, label: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) 
 /// with `size_bits` (0 = default), placing the resulting cap at `dest_slot`.
 pub fn untyped_retype(untyped: Cap, new_type: u64, size_bits: u64, dest_slot: u64) -> i32 {
     invoke(untyped, UNTYPED_RETYPE, new_type, size_bits, dest_slot, 0).error as i32
+}
+
+/// Reset an exhausted untyped once all typed children have been destroyed.
+pub fn untyped_reset(untyped: Cap) -> i32 {
+    invoke(untyped, UNTYPED_RESET, 0, 0, 0, 0).error as i32
 }
 
 /// Retype with explicit CNode depth (for expanded CSpace hierarchy).
@@ -84,20 +90,6 @@ pub fn tcb_write_registers(tcb: Cap, flags: u64, rip: u64, rsp: u64) -> i32 {
 /// Suspend a TCB (remove from scheduler ready queue).
 pub fn tcb_suspend(tcb: Cap) -> i32 {
     invoke(tcb, TCB_SUSPEND, 0, 0, 0, 0).error as i32
-}
-
-/// Suspend a thread, retrying on Busy (cross-CPU contention).
-/// Yields between retries to give the target CPU time to context-switch.
-/// Returns 0 on success, or the last error code after max retries.
-pub fn tcb_suspend_retry(tcb: Cap, max_retries: u32) -> i32 {
-    for _ in 0..max_retries {
-        let err = tcb_suspend(tcb);
-        if err != crate::consts::TRONA_BUSY as i32 {
-            return err;
-        }
-        crate::syscall::syscall(crate::consts::SYS_YIELD, 0, 0, 0, 0, 0, 0);
-    }
-    tcb_suspend(tcb)
 }
 
 /// Bind a notification object to a TCB. Signals on the notification
@@ -165,6 +157,9 @@ pub fn vspace_map(vspace: Cap, frame: Cap, vaddr: u64, flags: u64) -> i32 {
 }
 
 /// Unmap the page at `vaddr` from the given VSpace.
+///
+/// For tracked MO-backed mappings this also shrinks/removes the associated
+/// VmArea and reverse-map metadata for that single page.
 pub fn vspace_unmap(vspace: Cap, vaddr: u64) -> i32 {
     invoke(vspace, VSPACE_UNMAP, vaddr, 0, 0, 0).error as i32
 }
@@ -193,7 +188,7 @@ pub fn vspace_walk(vspace: Cap, start_vaddr: u64, max_entries: u64) -> i32 {
 }
 
 /// Start word offset in IPC buffer page for `VSPACE_WALK` tuples (new ABI).
-pub const VSPACE_WALK_ENTRY_BASE_WORD: usize = 30;
+pub const VSPACE_WALK_ENTRY_BASE_WORD: usize = 42;
 /// Tuple width in u64 words: `(vaddr, phys, flags)`.
 pub const VSPACE_WALK_ENTRY_WORDS: usize = 3;
 
@@ -213,8 +208,8 @@ pub fn vspace_walk_result_header() -> Option<(u64, u64)> {
 pub fn vspace_walk_result_entry(index: usize) -> Option<(u64, u64, u64)> {
     unsafe {
         let ipc_words = walk_ipc_words()?;
-        let offset = VSPACE_WALK_ENTRY_BASE_WORD
-            .checked_add(index.checked_mul(VSPACE_WALK_ENTRY_WORDS)?)?;
+        let offset =
+            VSPACE_WALK_ENTRY_BASE_WORD.checked_add(index.checked_mul(VSPACE_WALK_ENTRY_WORDS)?)?;
         let ipc_words_total = ::core::mem::size_of::<IpcBuffer>() / ::core::mem::size_of::<u64>();
         if offset + 2 >= ipc_words_total {
             return None;
@@ -366,7 +361,15 @@ pub fn vspace_set_cow_notif(vspace: Cap, ring_frame: Cap, notif: Cap) -> i32 {
 /// The kernel walks `src_cnode` slots start_slot..start_slot+count, extracts
 /// physical addresses, and appends them to the pool page.
 pub fn vspace_replenish_cow_pool(vspace: Cap, src_cnode: Cap, start_slot: u64, count: u64) -> i32 {
-    invoke(vspace, VSPACE_REPLENISH_COW_POOL, src_cnode, start_slot, count, 0).error as i32
+    invoke(
+        vspace,
+        VSPACE_REPLENISH_COW_POOL,
+        src_cnode,
+        start_slot,
+        count,
+        0,
+    )
+    .error as i32
 }
 
 /// Install demand-page PTEs for a contiguous range.
@@ -391,6 +394,11 @@ pub fn vspace_map_demand_range(
 
 // ---- CNode operations ----
 
+#[inline]
+fn cspace_slot_depth(slot: u64) -> u8 {
+    slot_alloc::slot_invoke_depth(slot)
+}
+
 /// Copy a capability from `src_cnode[src_slot]` to `dest_cnode[dest_slot]`
 /// with the given `rights` mask.
 pub fn cnode_copy(
@@ -400,7 +408,18 @@ pub fn cnode_copy(
     dest_slot: u64,
     rights: u64,
 ) -> i32 {
-    invoke(src_cnode, CNODE_COPY, src_slot, dest_cnode, dest_slot, rights).error as i32
+    let src_depth = cspace_slot_depth(src_slot);
+    let dest_depth = cspace_slot_depth(dest_slot);
+    if src_depth == 0 && dest_depth == 0 {
+        invoke(
+            src_cnode, CNODE_COPY, src_slot, dest_cnode, dest_slot, rights,
+        )
+        .error as i32
+    } else {
+        cnode_copy_depth(
+            src_cnode, src_slot, dest_cnode, dest_slot, rights, src_depth, dest_depth,
+        )
+    }
 }
 
 /// Copy a capability with a badge applied (mint = copy + badge).
@@ -411,12 +430,32 @@ pub fn cnode_mint(
     dest_slot: u64,
     badge: u64,
 ) -> i32 {
-    invoke(src_cnode, CNODE_MINT, src_slot, dest_cnode, dest_slot, badge).error as i32
+    let src_depth = cspace_slot_depth(src_slot);
+    let dest_depth = cspace_slot_depth(dest_slot);
+    if src_depth == 0 && dest_depth == 0 {
+        invoke(
+            src_cnode, CNODE_MINT, src_slot, dest_cnode, dest_slot, badge,
+        )
+        .error as i32
+    } else {
+        write_invoke_depth(src_depth, dest_depth);
+        invoke(
+            src_cnode, CNODE_MINT, src_slot, dest_cnode, dest_slot, badge,
+        )
+        .error as i32
+    }
 }
 
 /// Move a capability (src slot becomes empty).
 pub fn cnode_move(dest_cnode: Cap, dest_slot: u64, src_cnode: Cap, src_slot: u64) -> i32 {
-    invoke(dest_cnode, CNODE_MOVE, dest_slot, src_cnode, src_slot, 0).error as i32
+    let dest_depth = cspace_slot_depth(dest_slot);
+    let src_depth = cspace_slot_depth(src_slot);
+    if dest_depth == 0 && src_depth == 0 {
+        invoke(dest_cnode, CNODE_MOVE, dest_slot, src_cnode, src_slot, 0).error as i32
+    } else {
+        write_invoke_depth(dest_depth, src_depth);
+        invoke(dest_cnode, CNODE_MOVE, dest_slot, src_cnode, src_slot, 0).error as i32
+    }
 }
 
 /// Move a capability with a badge change (mutate = move + rebadge).
@@ -427,22 +466,61 @@ pub fn cnode_mutate(
     src_slot: u64,
     badge: u64,
 ) -> i32 {
-    invoke(dest_cnode, CNODE_MUTATE, dest_slot, src_cnode, src_slot, badge).error as i32
+    let dest_depth = cspace_slot_depth(dest_slot);
+    let src_depth = cspace_slot_depth(src_slot);
+    if dest_depth == 0 && src_depth == 0 {
+        invoke(
+            dest_cnode,
+            CNODE_MUTATE,
+            dest_slot,
+            src_cnode,
+            src_slot,
+            badge,
+        )
+        .error as i32
+    } else {
+        write_invoke_depth(dest_depth, src_depth);
+        invoke(
+            dest_cnode,
+            CNODE_MUTATE,
+            dest_slot,
+            src_cnode,
+            src_slot,
+            badge,
+        )
+        .error as i32
+    }
 }
 
 /// Save the reply capability from the last Call into a CNode slot.
 pub fn cnode_save_caller(cnode: Cap, slot: u64) -> i32 {
-    invoke(cnode, CNODE_SAVE_CALLER, slot, 0, 0, 0).error as i32
+    let depth = cspace_slot_depth(slot);
+    if depth == 0 {
+        invoke(cnode, CNODE_SAVE_CALLER, slot, 0, 0, 0).error as i32
+    } else {
+        write_invoke_depth(depth, 0);
+        invoke(cnode, CNODE_SAVE_CALLER, slot, 0, 0, 0).error as i32
+    }
 }
 
 /// Delete (clear) a capability slot.
 pub fn cnode_delete(cnode: Cap, slot: u64) -> i32 {
-    invoke(cnode, CNODE_DELETE, slot, 0, 0, 0).error as i32
+    let depth = cspace_slot_depth(slot);
+    if depth == 0 {
+        invoke(cnode, CNODE_DELETE, slot, 0, 0, 0).error as i32
+    } else {
+        cnode_delete_depth(cnode, slot, depth)
+    }
 }
 
 /// Revoke a capability and all its CDT children.
 pub fn cnode_revoke(cnode: Cap, slot: u64) -> i32 {
-    invoke(cnode, CNODE_REVOKE, slot, 0, 0, 0).error as i32
+    let depth = cspace_slot_depth(slot);
+    if depth == 0 {
+        invoke(cnode, CNODE_REVOKE, slot, 0, 0, 0).error as i32
+    } else {
+        cnode_revoke_depth(cnode, slot, depth)
+    }
 }
 
 /// Set the guard value and guard bits on a CNode.
@@ -514,7 +592,15 @@ pub fn ioport_create(
     dest_cnode: Cap,
     dest_slot: u64,
 ) -> i32 {
-    invoke(irq_ctrl, IOPORT_CREATE, base_port, num_ports, dest_cnode, dest_slot).error as i32
+    invoke(
+        irq_ctrl,
+        IOPORT_CREATE,
+        base_port,
+        num_ports,
+        dest_cnode,
+        dest_slot,
+    )
+    .error as i32
 }
 
 // ---- IRQ control operations ----
@@ -543,7 +629,15 @@ pub fn device_untyped_create(
     dest_cnode: Cap,
     dest_slot: u64,
 ) -> i32 {
-    invoke(irq_ctrl, DEVICE_UNTYPED_CREATE, phys_addr, size_bits, dest_cnode, dest_slot).error as i32
+    invoke(
+        irq_ctrl,
+        DEVICE_UNTYPED_CREATE,
+        phys_addr,
+        size_bits,
+        dest_cnode,
+        dest_slot,
+    )
+    .error as i32
 }
 
 /// Fork a range of pages from parent VSpace (invoke target) to child VSpace.
@@ -593,12 +687,10 @@ pub fn mo_get_size(mo: Cap) -> (i32, u64) {
     (r.error as i32, r.value)
 }
 
-/// Create a COW snapshot clone of a MemoryObject.
-/// `child_mo_slot` is the destination cap slot for the new child MO.
-/// `flags` can include clone options.
-/// Returns 0 on success.
-pub fn mo_clone(mo: Cap, child_mo_slot: u64, flags: u64) -> i32 {
-    invoke(mo, MO_CLONE, child_mo_slot, flags, 0, 0).error as i32
+/// Initialize an existing child MemoryObject as a COW clone of `mo`.
+/// `child_mo` must already name a freshly allocated MemoryObject capability.
+pub fn mo_clone(mo: Cap, child_mo: Cap, flags: u64) -> i32 {
+    invoke(mo, MO_CLONE, child_mo, flags, 0, 0).error as i32
 }
 
 /// Resize a MemoryObject (only works if created with RESIZABLE flag).
@@ -636,23 +728,19 @@ pub fn vspace_map_mo_with_count(
     mo_offset: u64,
     count_and_flags: u64,
 ) -> (i32, u64) {
-    let r = invoke(vspace, VSPACE_MAP_MO, mo_cap, vaddr, mo_offset, count_and_flags);
+    let r = invoke(
+        vspace,
+        VSPACE_MAP_MO,
+        mo_cap,
+        vaddr,
+        mo_offset,
+        count_and_flags,
+    );
     (r.error as i32, r.value)
 }
 
-pub fn vspace_map_mo(
-    vspace: Cap,
-    mo_cap: u64,
-    vaddr: u64,
-    mo_offset: u64,
-    count_and_flags: u64,
-) -> i32 {
+pub fn vspace_map_mo(vspace: Cap, mo_cap: u64, vaddr: u64, mo_offset: u64, count_and_flags: u64) -> i32 {
     vspace_map_mo_with_count(vspace, mo_cap, vaddr, mo_offset, count_and_flags).0
-}
-
-/// Unmap a MO range from a VSpace.
-pub fn vspace_unmap_mo(vspace: Cap, vaddr: u64, count: u64) -> i32 {
-    invoke(vspace, VSPACE_UNMAP_MO, vaddr, count, 0, 0).error as i32
 }
 
 // ===========================================================================
@@ -675,7 +763,10 @@ pub fn cnode_copy_depth(
     dest_depth: u8,
 ) -> i32 {
     write_invoke_depth(src_depth, dest_depth);
-    invoke(src_cnode, CNODE_COPY, src_slot, dest_cnode, dest_slot, rights).error as i32
+    invoke(
+        src_cnode, CNODE_COPY, src_slot, dest_cnode, dest_slot, rights,
+    )
+    .error as i32
 }
 
 pub fn cnode_delete_depth(cnode: Cap, slot: u64, depth: u8) -> i32 {

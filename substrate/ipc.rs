@@ -112,12 +112,12 @@ pub unsafe fn set_receive_slot_ctx(ctx: *mut IpcContext, cnode: Cap, index: u64,
     }
 }
 
-/// Write overflow message registers (regs[4..19]) into the IPC buffer.
+/// Write overflow message registers (regs[4..31]) into the IPC buffer.
 /// Called before send/call/reply_recv when the message exceeds 4 registers.
 unsafe fn write_overflow_ctx(ctx: *mut IpcContext, msg: *const TronaMsg) {
     unsafe {
         let len = (*msg).length as u32;
-        let len = if len > 20 { 20 } else { len };
+        let len = if len > 32 { 32 } else { len };
         if ctx.is_null() || len <= 4 {
             return;
         }
@@ -125,7 +125,7 @@ unsafe fn write_overflow_ctx(ctx: *mut IpcContext, msg: *const TronaMsg) {
         if c.ipc_buffer.is_null() {
             return;
         }
-        let n = ::core::cmp::min(len as i32 - 4, 16);
+        let n = ::core::cmp::min(len as i32 - 4, 28);
         for i in 0..n as usize {
             (*c.ipc_buffer).msg[6 + i] = (*msg).regs[4 + i];
         }
@@ -177,6 +177,38 @@ pub unsafe fn send_ctx(ctx: *mut IpcContext, ep: Cap, msg: *const TronaMsg) -> i
     }
 }
 
+/// Blocking send with timeout. Same register layout as `send_ctx`;
+/// timeout is passed through `IpcBuffer.timeout_ns`.
+/// Returns 0 on success, TRONA_CANCELLED on timeout.
+pub unsafe fn send_timed_ctx(
+    ctx: *mut IpcContext,
+    ep: Cap,
+    msg: *const TronaMsg,
+    timeout_ns: u64,
+) -> i32 {
+    unsafe {
+        if !ctx.is_null() && !(*ctx).ipc_buffer.is_null() {
+            (*(*ctx).ipc_buffer).timeout_ns = timeout_ns;
+        }
+        let caps = if ctx.is_null() { 0 } else { (*ctx).send_cap_count };
+        let info = msginfo((*msg).label, (*msg).length, caps as u64);
+        write_overflow_ctx(ctx, msg);
+        let r = syscall(
+            SYS_SEND_TIMED,
+            ep,
+            info,
+            (*msg).regs[0],
+            (*msg).regs[1],
+            (*msg).regs[2],
+            (*msg).regs[3],
+        );
+        if caps > 0 && !ctx.is_null() {
+            clear_send_caps_ctx(ctx);
+        }
+        r.error as i32
+    }
+}
+
 /// Blocking receive on an endpoint. Blocks until a sender arrives.
 /// On success, copies the received message into `*msg` and writes the
 /// sender's badge to `*badge`. Returns 0 on success.
@@ -210,7 +242,12 @@ pub unsafe fn recv_timed_ctx(
     msg: *mut TronaMsg,
     badge: *mut u64,
 ) -> i32 {
-    let r = syscall(SYS_RECV_TIMED, ep, timeout_ns, 0, 0, 0, 0);
+    unsafe {
+        if !ctx.is_null() && !(*ctx).ipc_buffer.is_null() {
+            (*(*ctx).ipc_buffer).timeout_ns = timeout_ns;
+        }
+    }
+    let r = syscall(SYS_RECV_TIMED, ep, 0, 0, 0, 0, 0);
     if r.error == 0 {
         unsafe {
             if !badge.is_null() {
@@ -269,7 +306,10 @@ pub unsafe fn recv_any_timed_ctx(
         if !stage_recv_any_endpoints_ctx(ctx, endpoints, endpoint_count) {
             return TRONA_INVALID_ARGUMENT as i32;
         }
-        let r = syscall(SYS_RECV_ANY_TIMED, endpoint_count as u64, timeout_ns, 0, 0, 0, 0);
+        if !ctx.is_null() && !(*ctx).ipc_buffer.is_null() {
+            (*(*ctx).ipc_buffer).timeout_ns = timeout_ns;
+        }
+        let r = syscall(SYS_RECV_ANY_TIMED, endpoint_count as u64, 0, 0, 0, 0, 0);
         if r.error == 0 {
             if !source.is_null() {
                 *source = r.value;
@@ -424,7 +464,7 @@ pub unsafe fn reply_recv_any_timed_ctx(
             return TRONA_INVALID_ARGUMENT as i32;
         }
         if !ctx.is_null() && !(*ctx).ipc_buffer.is_null() {
-            (*(*ctx).ipc_buffer).reserved[endpoint_count] = timeout_ns;
+            (*(*ctx).ipc_buffer).timeout_ns = timeout_ns;
         }
         let caps = if ctx.is_null() { 0 } else { (*ctx).send_cap_count };
         let info = msginfo((*reply).label, (*reply).length, caps as u64);

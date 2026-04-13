@@ -29,8 +29,13 @@ pub mod server {
     include!("../uapi/protocol/server.rs");
 }
 
+pub mod rsrcsrv {
+    include!("../uapi/protocol/rsrcsrv.rs");
+}
+
 pub use mmsrv::*;
 pub use namesrv::*;
 pub use procmgr::*;
+pub use rsrcsrv::*;
 pub use server::*;
 pub use vfs::*;
