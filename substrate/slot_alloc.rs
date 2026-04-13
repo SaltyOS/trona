@@ -2,35 +2,36 @@
 //!
 //! Provides a bump allocator over a chained array of CNode slot segments.
 //! The initial segment is assigned by procmgr/init at spawn time. When all
-//! segments are exhausted, an expansion protocol requests more slots from
-//! the process manager (CSpace expansion via Signal+probe or blocking Call).
+//! segments are exhausted, an expansion protocol requests more slots via
+//! CSpace expansion (Signal+probe to procmgr's bound notification).
 //!
-//! The pool base and count are communicated via auxv entries
-//! `AT_TRONA_SLOT_BASE` and `AT_TRONA_SLOT_COUNT`.
+//! The initial allocator range is communicated through the startup CSpace
+//! layout descriptor (`AT_TRONA_CSPACE_LAYOUT`) as `[alloc_base, alloc_limit)`.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
 use crate::consts::*;
 use crate::invoke;
-use crate::ipc;
-use crate::protocol::PM_EXPAND_CSPACE;
 use crate::syscall::syscall;
 use crate::types::Cap;
 
 // Standard child CSpace layout
 const CAP_SELF_TCB: u64 = 0;
 const CAP_SELF_CSPACE: u64 = 2;
-const CAP_PROCMGR_EP: u64 = 3;
 
 const SLOT_EXPAND_BITS_DEFAULT: u64 = 10;
 const MAX_SEGMENTS: usize = 16;
+const MAX_SEGMENT_SLOTS: usize = 4096;
+const SEGMENT_BITMAP_WORDS: usize = MAX_SEGMENT_SLOTS / 64;
 
 /// A contiguous range of CNode slots available for allocation.
 #[derive(Clone, Copy)]
 struct Segment {
     base: Cap,
     count: u64,
-    next: u64,
+    alloc_hint: u64,
+    used: u64,
+    bits: [u64; SEGMENT_BITMAP_WORDS],
 }
 
 /// Result of an async slot allocation attempt.
@@ -55,14 +56,19 @@ enum ExpandState {
     Failed,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ExpandProgress {
+    Completed,
+    Pending,
+    Failed,
+}
+
 /// Internal state for the per-process slot allocator.
 struct SlotAllocState {
     segments: [Segment; MAX_SEGMENTS],
     seg_count: usize,
     active_seg: usize,
     initialized: bool,
-    /// Procmgr EP for CSpace expansion (always CAP_PROCMGR_EP).
-    procmgr_ep: Cap,
     /// Notification cap for CSpace expansion signaling.
     cspace_ntfn: Cap,
     expand_state: ExpandState,
@@ -75,11 +81,16 @@ struct SlotAllocState {
 }
 
 static mut SLOT_ALLOC: SlotAllocState = SlotAllocState {
-    segments: [Segment { base: 0, count: 0, next: 0 }; MAX_SEGMENTS],
+    segments: [Segment {
+        base: 0,
+        count: 0,
+        alloc_hint: 0,
+        used: 0,
+        bits: [0; SEGMENT_BITMAP_WORDS],
+    }; MAX_SEGMENTS],
     seg_count: 0,
     active_seg: 0,
     initialized: false,
-    procmgr_ep: 0,
     cspace_ntfn: 0,
     expand_state: ExpandState::Idle,
     root_bits: 0,
@@ -93,7 +104,10 @@ static SLOT_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32:
 #[inline]
 fn slot_lock_acquire() {
     use core::sync::atomic::Ordering;
-    while SLOT_LOCK.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+    while SLOT_LOCK
+        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
         while SLOT_LOCK.load(Ordering::Relaxed) != 0 {
             core::hint::spin_loop();
         }
@@ -103,21 +117,6 @@ fn slot_lock_acquire() {
 #[inline]
 fn slot_lock_release() {
     SLOT_LOCK.store(0, core::sync::atomic::Ordering::Release);
-}
-
-/// Guards against concurrent CSpace expansion requests.
-/// Only one thread performs the blocking RPC at a time; others yield and retry.
-static EXPANDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// Get the procmgr endpoint for CSpace expansion.
-///
-/// # Safety
-/// Must be called after slot_alloc_init.
-unsafe fn get_expand_ep() -> Cap {
-    unsafe {
-        let state = &*(&raw const SLOT_ALLOC);
-        if state.procmgr_ep != 0 { state.procmgr_ep } else { CAP_PROCMGR_EP }
-    }
 }
 
 /// Register a newly expanded CNode segment under SLOT_LOCK.
@@ -132,9 +131,19 @@ unsafe fn register_new_segment(base: Cap, count: u64, _label: &[u8]) -> bool {
             state.expand_state = ExpandState::Failed;
             return false;
         }
+        if count as usize > MAX_SEGMENT_SLOTS {
+            state.expand_state = ExpandState::Failed;
+            return false;
+        }
 
         let si = state.seg_count;
-        state.segments[si] = Segment { base, count, next: 0 };
+        state.segments[si] = Segment {
+            base,
+            count,
+            alloc_hint: 0,
+            used: 0,
+            bits: [0; SEGMENT_BITMAP_WORDS],
+        };
         state.seg_count += 1;
         state.active_seg = si;
         state.expand_state = ExpandState::Idle;
@@ -155,37 +164,10 @@ unsafe fn register_new_segment(base: Cap, count: u64, _label: &[u8]) -> bool {
     }
 }
 
-/// Perform CSpace expansion without holding SLOT_LOCK.
-///
-/// Uses an `EXPANDING` CAS guard so only one thread performs the blocking
-/// RPC at a time. Returns true if expansion succeeded or is in progress
-/// (caller should retry), false if expansion permanently failed.
-fn try_expand(ep: Cap) -> bool {
-    use core::sync::atomic::Ordering;
-    // Only one thread expands at a time
-    if EXPANDING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        // Another thread is expanding — yield and let caller retry
-        syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-        return true;
-    }
-    let result = request_expand_blocking(ep);
-    EXPANDING.store(false, Ordering::Release);
-    match result {
-        Some((base, count)) => {
-            slot_lock_acquire();
-            // SAFETY: SLOT_LOCK held, register_new_segment accesses SLOT_ALLOC safely
-            let ok = unsafe { register_new_segment(base, count, b"sync") };
-            slot_lock_release();
-            ok
-        }
-        None => false,
-    }
-}
-
 /// Initialize the per-process slot allocator.
 ///
-/// Called during process startup (from CRT or RTLD) with values from auxv.
-/// `base==0` means "not provided".
+/// Called during process startup (from CRT or RTLD) with the initial
+/// allocator range. `base==0` or `count==0` means "not provided".
 /// `cspace_ntfn` is the notification cap for CSpace expansion signaling
 /// (from AT_TRONA_CSPACE_NTFN auxv), or 0 if not available.
 ///
@@ -194,16 +176,54 @@ fn try_expand(ep: Cap) -> bool {
 pub unsafe fn slot_alloc_init(base: Cap, count: u64, cspace_ntfn: u64) {
     unsafe {
         let state = &mut *(&raw mut SLOT_ALLOC);
-        state.segments[0] = Segment { base, count, next: 0 };
-        state.seg_count = 1;
+        for seg in &mut state.segments {
+            *seg = Segment {
+                base: 0,
+                count: 0,
+                alloc_hint: 0,
+                used: 0,
+                bits: [0; SEGMENT_BITMAP_WORDS],
+            };
+        }
+        state.seg_count = 0;
         state.active_seg = 0;
-        state.initialized = base != 0;
-        state.procmgr_ep = CAP_PROCMGR_EP;
         state.cspace_ntfn = cspace_ntfn;
         state.expand_state = ExpandState::Idle;
         state.root_bits = 0;
         state.expanded_depth = 0;
         state.cspace_expand_count = 0;
+
+        let mut next_base = base;
+        let mut remaining = count;
+        if remaining == 0 && base != 0 {
+            state.segments[0] = Segment {
+                base,
+                count: 0,
+                alloc_hint: 0,
+                used: 0,
+                bits: [0; SEGMENT_BITMAP_WORDS],
+            };
+            state.seg_count = 1;
+        }
+        while remaining != 0 && state.seg_count < MAX_SEGMENTS {
+            let chunk = core::cmp::min(remaining, MAX_SEGMENT_SLOTS as u64);
+            let si = state.seg_count;
+            state.segments[si] = Segment {
+                base: next_base,
+                count: chunk,
+                alloc_hint: 0,
+                used: 0,
+                bits: [0; SEGMENT_BITMAP_WORDS],
+            };
+            state.seg_count += 1;
+            next_base += chunk;
+            remaining -= chunk;
+        }
+
+        state.initialized = remaining == 0 && (count != 0 || base != 0);
+        if !state.initialized {
+            state.seg_count = 0;
+        }
     }
 }
 
@@ -216,7 +236,11 @@ pub fn slot_alloc_is_initialized() -> bool {
 pub fn slot_alloc_base() -> Cap {
     unsafe {
         let state = &*(&raw const SLOT_ALLOC);
-        if state.seg_count > 0 { state.segments[0].base } else { 0 }
+        if state.seg_count > 0 {
+            state.segments[0].base
+        } else {
+            0
+        }
     }
 }
 
@@ -240,17 +264,12 @@ pub fn slot_alloc_remaining() -> u64 {
             return 0;
         }
         let mut remaining: u64 = 0;
-        for i in state.active_seg..state.seg_count {
-            remaining += state.segments[i].count.saturating_sub(state.segments[i].next);
+        for i in 0..state.seg_count {
+            remaining += state.segments[i]
+                .count
+                .saturating_sub(state.segments[i].used);
         }
         remaining
-    }
-}
-
-/// Override the procmgr EP used for expansion (escape hatch).
-pub fn slot_alloc_set_procmgr_ep(ep: Cap) {
-    unsafe {
-        (*(&raw mut SLOT_ALLOC)).procmgr_ep = ep;
     }
 }
 
@@ -261,6 +280,24 @@ pub fn slot_alloc_set_procmgr_ep(ep: Cap) {
 /// CSpace depth via `tcb_set_space_with_depth`.
 pub fn observed_cspace_depth() -> u8 {
     unsafe { (*(&raw const SLOT_ALLOC)).expanded_depth }
+}
+
+/// Return the invoke depth required for a slot address in the current CSpace.
+///
+/// Flat root slots return 0. Expanded sub-CNode addresses return the observed
+/// expanded depth once the allocator has successfully probed at least one
+/// expansion segment.
+pub fn slot_invoke_depth(slot: Cap) -> u8 {
+    let depth = observed_cspace_depth();
+    if depth == 0 {
+        return 0;
+    }
+
+    if (slot >> SLOT_EXPAND_BITS_DEFAULT) >= CSPACE_EXPAND_BASE {
+        depth
+    } else {
+        0
+    }
 }
 
 /// Async slot allocation with self-healing NBSend expansion protocol.
@@ -283,14 +320,8 @@ unsafe fn slot_alloc_async_inner() -> SlotResult {
         }
 
         // Fast path: scan segment chain for an available slot
-        while state.active_seg < state.seg_count {
-            let seg = &mut state.segments[state.active_seg];
-            if seg.next < seg.count {
-                let slot = seg.base + seg.next;
-                seg.next += 1;
-                return SlotResult::Ok(slot);
-            }
-            state.active_seg += 1;
+        if let Some(slot) = alloc_single_locked(state) {
+            return SlotResult::Ok(slot);
         }
 
         // All segments exhausted — enter CSpace expansion protocol.
@@ -302,11 +333,7 @@ unsafe fn slot_alloc_async_inner() -> SlotResult {
         match state.expand_state {
             ExpandState::Idle => {
                 if ntfn == 0 || state.cspace_expand_count >= MAX_CSPACE_EXPANSIONS {
-                    // No cspace ntfn or max expansions reached — fall back to
-                    // blocking expansion via procmgr EP if available.
-                    // Release SLOT_LOCK, expand via blocking RPC, reacquire.
-                    // Caller (slot_alloc_async) will release SLOT_LOCK after we return.
-                    return try_blocking_cspace_expand();
+                    return SlotResult::Exhausted;
                 }
                 // Ensure root_bits is known for depth-aware probing
                 ensure_root_bits(state);
@@ -316,70 +343,15 @@ unsafe fn slot_alloc_async_inner() -> SlotResult {
                 state.expand_state = ExpandState::Requested;
                 SlotResult::WouldBlock
             }
-            ExpandState::Requested => {
-                // Probe: try copying a known cap into the first slot of the
-                // expected sub-CNode. If the sub-CNode exists, the copy
-                // succeeds. We then delete the probe cap and register the
-                // new segment.
-                let probe_root_slot = CSPACE_EXPAND_BASE + state.cspace_expand_count as u64;
-                let expanded_depth = state.root_bits + SLOT_EXPAND_BITS_DEFAULT as u8;
-                let probe_addr = probe_root_slot << SLOT_EXPAND_BITS_DEFAULT;
-
-                let err = invoke::cnode_copy_depth(
-                    CAP_SELF_CSPACE, CAP_SELF_TCB,
-                    CAP_SELF_CSPACE, probe_addr,
-                    CAP_RIGHTS_ALL,
-                    0, expanded_depth,
-                );
-                if err == 0 {
-                    // Sub-CNode exists — clean up probe cap
-                    invoke::cnode_delete_depth(
-                        CAP_SELF_CSPACE, probe_addr, expanded_depth,
-                    );
-
-                    let base = probe_addr;
-                    let count = 1u64 << SLOT_EXPAND_BITS_DEFAULT;
-
-                    if state.seg_count >= MAX_SEGMENTS {
-                        state.expand_state = ExpandState::Failed;
-                        return SlotResult::Exhausted;
-                    }
-
-                    let si = state.seg_count;
-                    state.segments[si] = Segment { base, count, next: 0 };
-                    state.seg_count += 1;
-                    state.active_seg = si;
-                    state.cspace_expand_count += 1;
-                    state.expand_state = ExpandState::Idle;
-
-                    if state.root_bits > 0 {
-                        state.expanded_depth = expanded_depth;
-                    }
-
-                    crate::udebug!(|_lb| {
-                        _lb.str(b"[SLOT] cspace-expand: probed base=");
-                        _lb.hex(base);
-                        _lb.str(b" count=");
-                        _lb.hex(count);
-                        _lb.str(b" (seg ");
-                        _lb.hex(si as u64);
-                        _lb.str(b")\n");
-                    });
-
-                    // Allocate from the new segment
-                    let seg = &mut state.segments[si];
-                    let slot = seg.base + seg.next;
-                    seg.next += 1;
-                    SlotResult::Ok(slot)
-                } else {
-                    // Not ready yet — re-signal (idempotent: OR same badge bit)
-                    syscall(SYS_SIGNAL, ntfn, 0, 0, 0, 0, 0);
-                    SlotResult::WouldBlock
-                }
-            }
-            ExpandState::Failed => {
-                SlotResult::Exhausted
-            }
+            ExpandState::Requested => match poll_requested_expand_locked(state, ntfn) {
+                ExpandProgress::Completed => match alloc_single_locked(state) {
+                    Some(slot) => SlotResult::Ok(slot),
+                    None => SlotResult::Exhausted,
+                },
+                ExpandProgress::Pending => SlotResult::WouldBlock,
+                ExpandProgress::Failed => SlotResult::Exhausted,
+            },
+            ExpandState::Failed => SlotResult::Exhausted,
         }
     }
 }
@@ -404,9 +376,7 @@ pub fn slot_alloc_consecutive(count: u64) -> Option<Cap> {
         if let Some(cap) = result {
             return Some(cap);
         }
-        // All segments exhausted — expand without holding SLOT_LOCK
-        let ep = unsafe { get_expand_ep() };
-        if !try_expand(ep) {
+        if !drive_cspace_expand_blocking() {
             return None;
         }
     }
@@ -423,18 +393,12 @@ unsafe fn slot_alloc_consecutive_fast(count: u64) -> Option<Cap> {
         if !state.initialized || count == 0 {
             return None;
         }
-        // Scan from active_seg forward using a LOCAL index.
-        // Do NOT modify state.active_seg — a segment with <count remaining
-        // slots may still have room for single slot_alloc() calls.
-        let mut scan = state.active_seg;
-        while scan < state.seg_count {
-            let seg = &mut state.segments[scan];
-            if count <= seg.count && seg.next <= seg.count - count {
-                let base = seg.base + seg.next;
-                seg.next += count;
+        for off in 0..state.seg_count {
+            let idx = (state.active_seg + off) % state.seg_count;
+            if let Some(base) = segment_alloc_contiguous(&mut state.segments[idx], count) {
+                state.active_seg = idx;
                 return Some(base);
             }
-            scan += 1;
         }
         None
     }
@@ -456,13 +420,26 @@ pub fn slot_alloc() -> Option<Cap> {
         if let Some(cap) = result {
             return Some(cap);
         }
-        // All segments exhausted — expand without holding SLOT_LOCK
-        let ep = unsafe { get_expand_ep() };
-        if !try_expand(ep) {
+        if !drive_cspace_expand_blocking() {
             return None;
         }
     }
     None
+}
+
+/// Allocate a single CNode slot from already-registered segments only.
+///
+/// Unlike `slot_alloc()`, this never triggers CSpace expansion. Callers that
+/// must not recurse into procmgr from a server handler can use this to fail
+/// fast on local slot exhaustion.
+pub fn slot_alloc_no_expand() -> Option<Cap> {
+    if !slot_alloc_is_initialized() {
+        return None;
+    }
+    slot_lock_acquire();
+    let result = unsafe { slot_alloc_fast() };
+    slot_lock_release();
+    result
 }
 
 /// Fast path: scan segments for an available slot. No blocking calls.
@@ -475,22 +452,231 @@ unsafe fn slot_alloc_fast() -> Option<Cap> {
         if !state.initialized {
             return None;
         }
-        while state.active_seg < state.seg_count {
-            let seg = &mut state.segments[state.active_seg];
-            if seg.next < seg.count {
-                let slot = seg.base + seg.next;
-                seg.next += 1;
-                return Some(slot);
-            }
-            state.active_seg += 1;
-        }
-        None
+        alloc_single_locked(state)
     }
+}
+
+pub fn slot_free(slot: Cap) -> bool {
+    slot_lock_acquire();
+    let ok = unsafe { slot_free_locked(slot) };
+    slot_lock_release();
+    ok
+}
+
+pub fn slot_free_range(base: Cap, count: u64) {
+    if count == 0 {
+        return;
+    }
+    slot_lock_acquire();
+    unsafe {
+        let mut off = 0u64;
+        while off < count {
+            let _ = slot_free_locked(base + off);
+            off += 1;
+        }
+    }
+    slot_lock_release();
+}
+
+unsafe fn slot_free_locked(slot: Cap) -> bool {
+    unsafe {
+        let state = &mut *(&raw mut SLOT_ALLOC);
+        if !state.initialized {
+            return false;
+        }
+        for idx in 0..state.seg_count {
+            let seg = &mut state.segments[idx];
+            if let Some(slot_idx) = segment_slot_index(seg, slot) {
+                if segment_free(seg, slot_idx) {
+                    if idx < state.active_seg {
+                        state.active_seg = idx;
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
+    }
+}
+
+fn segment_slot_index(seg: &Segment, slot: Cap) -> Option<usize> {
+    if slot < seg.base {
+        return None;
+    }
+    let idx = slot - seg.base;
+    if idx >= seg.count {
+        return None;
+    }
+    Some(idx as usize)
+}
+
+fn segment_is_used(seg: &Segment, idx: usize) -> bool {
+    let word = idx / 64;
+    let bit = idx % 64;
+    (seg.bits[word] & (1u64 << bit)) != 0
+}
+
+fn segment_mark_used(seg: &mut Segment, idx: usize) {
+    let word = idx / 64;
+    let bit = idx % 64;
+    seg.bits[word] |= 1u64 << bit;
+    seg.used += 1;
+}
+
+fn segment_mark_free(seg: &mut Segment, idx: usize) {
+    let word = idx / 64;
+    let bit = idx % 64;
+    seg.bits[word] &= !(1u64 << bit);
+    seg.used = seg.used.saturating_sub(1);
+}
+
+fn segment_alloc_single(seg: &mut Segment) -> Option<Cap> {
+    if seg.used >= seg.count {
+        return None;
+    }
+    let count = seg.count as usize;
+    let start = (seg.alloc_hint as usize).min(count);
+    for idx in start..count {
+        if !segment_is_used(seg, idx) {
+            segment_mark_used(seg, idx);
+            seg.alloc_hint = (idx + 1) as u64;
+            return Some(seg.base + idx as u64);
+        }
+    }
+    for idx in 0..start {
+        if !segment_is_used(seg, idx) {
+            segment_mark_used(seg, idx);
+            seg.alloc_hint = (idx + 1) as u64;
+            return Some(seg.base + idx as u64);
+        }
+    }
+    None
+}
+
+fn segment_alloc_contiguous(seg: &mut Segment, count: u64) -> Option<Cap> {
+    if count == 0 || count > seg.count.saturating_sub(seg.used) {
+        return None;
+    }
+    if count == 1 {
+        return segment_alloc_single(seg);
+    }
+
+    let count_usize = count as usize;
+    let limit = seg.count as usize;
+    let mut run_start = 0usize;
+    let mut run_len = 0usize;
+    for idx in 0..limit {
+        if !segment_is_used(seg, idx) {
+            if run_len == 0 {
+                run_start = idx;
+            }
+            run_len += 1;
+            if run_len == count_usize {
+                for mark in run_start..(run_start + count_usize) {
+                    segment_mark_used(seg, mark);
+                }
+                seg.alloc_hint = (run_start + count_usize) as u64;
+                return Some(seg.base + run_start as u64);
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+    None
+}
+
+fn segment_free(seg: &mut Segment, idx: usize) -> bool {
+    if idx >= seg.count as usize || !segment_is_used(seg, idx) {
+        return false;
+    }
+    segment_mark_free(seg, idx);
+    if idx as u64 <= seg.alloc_hint {
+        seg.alloc_hint = idx as u64;
+    }
+    true
+}
+
+fn alloc_single_locked(state: &mut SlotAllocState) -> Option<Cap> {
+    if state.seg_count == 0 {
+        return None;
+    }
+    for off in 0..state.seg_count {
+        let idx = (state.active_seg + off) % state.seg_count;
+        if let Some(slot) = segment_alloc_single(&mut state.segments[idx]) {
+            state.active_seg = idx;
+            return Some(slot);
+        }
+    }
+    None
 }
 
 // ===========================================================================
 // CSpace expansion protocol helpers
 // ===========================================================================
+
+unsafe fn poll_requested_expand_locked(state: &mut SlotAllocState, ntfn: Cap) -> ExpandProgress {
+    unsafe {
+        let probe_root_slot = CSPACE_EXPAND_BASE + state.cspace_expand_count as u64;
+        let expanded_depth = state.root_bits + SLOT_EXPAND_BITS_DEFAULT as u8;
+        let probe_addr = probe_root_slot << SLOT_EXPAND_BITS_DEFAULT;
+
+        let err = invoke::cnode_copy_depth(
+            CAP_SELF_CSPACE,
+            CAP_SELF_TCB,
+            CAP_SELF_CSPACE,
+            probe_addr,
+            CAP_RIGHTS_ALL,
+            0,
+            expanded_depth,
+        );
+        if err != 0 {
+            if ntfn != 0 {
+                syscall(SYS_SIGNAL, ntfn, 0, 0, 0, 0, 0);
+            }
+            return ExpandProgress::Pending;
+        }
+
+        invoke::cnode_delete_depth(CAP_SELF_CSPACE, probe_addr, expanded_depth);
+
+        let base = probe_addr;
+        let count = 1u64 << SLOT_EXPAND_BITS_DEFAULT;
+
+        if state.seg_count >= MAX_SEGMENTS {
+            state.expand_state = ExpandState::Failed;
+            return ExpandProgress::Failed;
+        }
+
+        let si = state.seg_count;
+        state.segments[si] = Segment {
+            base,
+            count,
+            alloc_hint: 0,
+            used: 0,
+            bits: [0; SEGMENT_BITMAP_WORDS],
+        };
+        state.seg_count += 1;
+        state.active_seg = si;
+        state.cspace_expand_count += 1;
+        state.expand_state = ExpandState::Idle;
+
+        if state.root_bits > 0 {
+            state.expanded_depth = expanded_depth;
+        }
+
+        crate::udebug!(|_lb| {
+            _lb.str(b"[SLOT] cspace-expand: probed base=");
+            _lb.hex(base);
+            _lb.str(b" count=");
+            _lb.hex(count);
+            _lb.str(b" (seg ");
+            _lb.hex(si as u64);
+            _lb.str(b")\n");
+        });
+
+        ExpandProgress::Completed
+    }
+}
 
 /// Ensure root_bits is populated (lazy query on first expansion).
 fn ensure_root_bits(state: &mut SlotAllocState) {
@@ -507,87 +693,40 @@ fn ensure_root_bits(state: &mut SlotAllocState) {
     }
 }
 
-/// Fallback: synchronous blocking CSpace expansion via procmgr EP.
-/// Used when cspace_ntfn is unavailable or max async expansions are reached.
-///
-/// Releases SLOT_LOCK before the blocking RPC to avoid holding a spinlock
-/// during IPC. Uses the EXPANDING guard to serialize concurrent expansions.
-/// Reacquires SLOT_LOCK before returning (caller expects it held).
-fn try_blocking_cspace_expand() -> SlotResult {
-    // Read ep before releasing lock
-    let ep = unsafe {
-        let state = &*(&raw const SLOT_ALLOC);
-        if state.procmgr_ep != 0 { state.procmgr_ep } else { CAP_PROCMGR_EP }
-    };
-
-    // Release SLOT_LOCK before blocking RPC
-    slot_lock_release();
-
-    use core::sync::atomic::Ordering;
-    if EXPANDING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        // Another thread is expanding — yield and retry via WouldBlock
-        syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+fn drive_cspace_expand_blocking() -> bool {
+    loop {
         slot_lock_acquire();
-        return SlotResult::WouldBlock;
-    }
-    let result = request_expand_blocking(ep);
-    EXPANDING.store(false, Ordering::Release);
-
-    // Reacquire SLOT_LOCK to register the segment and allocate
-    slot_lock_acquire();
-
-    match result {
-        Some((base, count)) => {
-            // SAFETY: SLOT_LOCK held
-            if unsafe { register_new_segment(base, count, b"async-fallback") } {
-                // Allocate from the new segment
-                unsafe {
-                    let state = &mut *(&raw mut SLOT_ALLOC);
-                    let si = state.seg_count - 1;
-                    let seg = &mut state.segments[si];
-                    let slot = seg.base + seg.next;
-                    seg.next += 1;
-                    SlotResult::Ok(slot)
-                }
+        let progress = unsafe {
+            let state = &mut *(&raw mut SLOT_ALLOC);
+            if !state.initialized {
+                ExpandProgress::Failed
             } else {
-                SlotResult::Exhausted
+                let ntfn = state.cspace_ntfn;
+                if ntfn != 0 && state.cspace_expand_count < MAX_CSPACE_EXPANSIONS {
+                    ensure_root_bits(state);
+                    match state.expand_state {
+                        ExpandState::Idle => {
+                            syscall(SYS_SIGNAL, ntfn, 0, 0, 0, 0, 0);
+                            state.expand_state = ExpandState::Requested;
+                            ExpandProgress::Pending
+                        }
+                        ExpandState::Requested => poll_requested_expand_locked(state, ntfn),
+                        ExpandState::Failed => ExpandProgress::Failed,
+                    }
+                } else {
+                    slot_lock_release();
+                    return false;
+                }
             }
-        }
-        None => {
-            unsafe {
-                let state = &mut *(&raw mut SLOT_ALLOC);
-                state.expand_state = ExpandState::Failed;
+        };
+        slot_lock_release();
+
+        match progress {
+            ExpandProgress::Completed => return true,
+            ExpandProgress::Pending => {
+                syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
             }
-            SlotResult::Exhausted
-        }
-    }
-}
-
-/// Perform blocking PM_EXPAND_CSPACE Call and return the new segment.
-fn request_expand_blocking(ep: Cap) -> Option<(Cap, u64)> {
-    unsafe {
-        let mut msg = crate::types::TronaMsg::zeroed();
-        let mut reply = crate::types::TronaMsg::zeroed();
-        msg.label = PM_EXPAND_CSPACE;
-        msg.length = 1;
-        msg.regs[0] = SLOT_EXPAND_BITS_DEFAULT;
-
-        let err = ipc::call_ctx(
-            crate::current_ipc_ctx(),
-            ep,
-            &raw const msg,
-            &raw mut reply,
-        );
-        if err != 0 || reply.label != TRONA_OK || reply.length < 2 {
-            return None;
-        }
-
-        let base = reply.regs[0];
-        let count = reply.regs[1];
-        if base == 0 || count == 0 {
-            None
-        } else {
-            Some((base, count))
+            ExpandProgress::Failed => return false,
         }
     }
 }

@@ -627,6 +627,9 @@ pub unsafe fn cleanup_thread(desc: *mut ThreadDesc) {
                 if (*desc).ipc_frame_cap != 0 {
                     invoke::cnode_delete(CAP_SELF_CSPACE, (*desc).ipc_frame_cap);
                 }
+                if (*desc).tcb_cap != 0 {
+                    crate::slot_alloc::slot_free_range((*desc).tcb_cap, 3);
+                }
                 // Delete stack frame caps (consecutive range)
                 if (*desc).stack_frame_base != 0 {
                     for p in 0..(*desc).stack_frame_count {
@@ -635,6 +638,10 @@ pub unsafe fn cleanup_thread(desc: *mut ThreadDesc) {
                             (*desc).stack_frame_base + p,
                         );
                     }
+                    crate::slot_alloc::slot_free_range(
+                        (*desc).stack_frame_base,
+                        (*desc).stack_frame_count,
+                    );
                 }
                 // Delete TLS frame caps (consecutive range)
                 if (*desc).tls_frame_base != 0 {
@@ -644,6 +651,10 @@ pub unsafe fn cleanup_thread(desc: *mut ThreadDesc) {
                             (*desc).tls_frame_base + p,
                         );
                     }
+                    crate::slot_alloc::slot_free_range(
+                        (*desc).tls_frame_base,
+                        (*desc).tls_frame_count,
+                    );
                 }
             }
             ThreadOwner::Personality => {
@@ -766,7 +777,7 @@ fn query_sc_cap_from_procmgr() -> Cap {
         msg.label = PM_GET_THREAD_CAPS;
         msg.length = 0;
 
-        let err = ipc::call_ctx(ctx, CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
+        let err = ipc::call_ctx(ctx, crate::caps::procmgr_ep(), &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
             return 0;
         }
@@ -774,8 +785,4 @@ fn query_sc_cap_from_procmgr() -> Cap {
     }
 }
 
-// Well-known cap for procmgr endpoint (child inherits from parent)
-const CAP_PROCMGR_EP: Cap = 3;
-const CAP_SELF_TCB: Cap = 0;
-const CAP_SELF_VSPACE: Cap = 1;
-const CAP_SELF_CSPACE: Cap = 2;
+
