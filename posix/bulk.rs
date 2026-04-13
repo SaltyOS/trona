@@ -6,6 +6,7 @@
 //! and subsequent reads transfer data through the SHM instead of packing
 //! 152 bytes into IPC registers per round-trip.
 
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use trona::consts::kernel::*;
 use trona::consts::server::*;
 use trona::ipc;
@@ -13,10 +14,27 @@ use trona::protocol::*;
 use trona::types::core::*;
 
 /// Base address of the per-process bulk SHM mapping. 0 = not yet set up.
-static mut BULK_SHM_ADDR: u64 = 0;
+static BULK_SHM_ADDR: AtomicU64 = AtomicU64::new(0);
+static BULK_SHM_STATE: AtomicU32 = AtomicU32::new(0);
+const BULK_SHM_UNINIT: u32 = 0;
+const BULK_SHM_INITING: u32 = 1;
+const BULK_SHM_READY: u32 = 2;
 
-/// Whether the bulk SHM has been successfully set up.
-static mut BULK_SHM_READY: bool = false;
+#[inline]
+fn bulk_shm_state_ptr() -> *const u32 {
+    &BULK_SHM_STATE as *const AtomicU32 as *const u32
+}
+
+#[inline]
+fn finish_bulk_shm_setup(success: bool) -> bool {
+    if success {
+        BULK_SHM_STATE.store(BULK_SHM_READY, Ordering::Release);
+    } else {
+        BULK_SHM_STATE.store(BULK_SHM_UNINIT, Ordering::Release);
+    }
+    let _ = trona::syscall::futex_wake(bulk_shm_state_ptr(), u32::MAX);
+    success
+}
 
 /// Lazy one-time SHM setup. Returns true if bulk path is available.
 ///
@@ -29,61 +47,82 @@ static mut BULK_SHM_READY: bool = false;
 /// 152-byte-per-IPC read path.
 unsafe fn ensure_bulk_shm() -> bool {
     unsafe {
-        if *(&raw const BULK_SHM_READY) {
-            return true;
+        loop {
+            match BULK_SHM_STATE.load(Ordering::Acquire) {
+                BULK_SHM_READY => return true,
+                BULK_SHM_INITING => {
+                    let _ = trona::syscall::futex_wait(bulk_shm_state_ptr(), BULK_SHM_INITING);
+                    continue;
+                }
+                _ => {}
+            }
+
+            if BULK_SHM_STATE
+                .compare_exchange(
+                    BULK_SHM_UNINIT,
+                    BULK_SHM_INITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
         }
 
-        let vfs_ep = super::CAP_VFS_EP;
-        let mmsrv_ep = crate::mm::mmsrv_ep();
+        let vfs_ep = trona::caps::vfs_ep();
+        let mmsrv_ep = trona::caps::mmsrv_ep();
         if vfs_ep == 0 || mmsrv_ep == 0 {
-            return false;
+            return finish_bulk_shm_setup(false);
         }
 
         // Use badge-derived SHM ID (unique per process)
         let shm_id = super::proc::posix_getpid() as u64 | 0x42_0000_0000;
 
-        // 1. Create SHM via mmsrv
-        let mut msg = TronaMsg::zeroed();
-        let mut reply = TronaMsg::zeroed();
-        msg.label = MM_SHM_CREATE;
-        msg.regs[0] = shm_id;
-        msg.regs[1] = BULK_SHM_PAGES;
-        msg.length = 2;
-        crate::ipc_call_retry(mmsrv_ep, &raw const msg, &raw mut reply);
-        if reply.label != TRONA_OK && reply.label != TRONA_ALREADY_EXISTS {
-            return false;
-        }
+        if BULK_SHM_ADDR.load(Ordering::Acquire) == 0 {
+            // 1. Create SHM via mmsrv
+            let mut msg = TronaMsg::zeroed();
+            let mut reply = TronaMsg::zeroed();
+            msg.label = MM_SHM_CREATE;
+            msg.regs[0] = shm_id;
+            msg.regs[1] = BULK_SHM_PAGES;
+            msg.length = 2;
+            crate::ipc_call_retry(mmsrv_ep, &raw const msg, &raw mut reply);
+            if reply.label != TRONA_OK && reply.label != TRONA_ALREADY_EXISTS {
+                return finish_bulk_shm_setup(false);
+            }
 
-        // 2. Map into our address space
-        msg = TronaMsg::zeroed();
-        reply = TronaMsg::zeroed();
-        msg.label = MM_SHM_MAP;
-        msg.regs[0] = shm_id;
-        msg.regs[1] = 0; // self
-        msg.regs[2] = 0; // auto-place
-        msg.regs[3] = 0x3; // RW
-        msg.length = 4;
-        crate::ipc_call_retry(mmsrv_ep, &raw const msg, &raw mut reply);
-        if reply.label != TRONA_OK {
-            return false;
+            // 2. Map into our address space exactly once. If later VFS setup
+            // fails, retries reuse the same local mapping instead of leaking
+            // new auto-placed SHM mappings on each attempt.
+            msg = TronaMsg::zeroed();
+            reply = TronaMsg::zeroed();
+            msg.label = MM_SHM_MAP;
+            msg.regs[0] = shm_id;
+            msg.regs[1] = 0; // self
+            msg.regs[2] = 0; // auto-place
+            msg.regs[3] = 0x3; // RW
+            msg.length = 4;
+            crate::ipc_call_retry(mmsrv_ep, &raw const msg, &raw mut reply);
+            if reply.label != TRONA_OK {
+                return finish_bulk_shm_setup(false);
+            }
+            BULK_SHM_ADDR.store(reply.regs[0], Ordering::Release);
         }
-        *(&raw mut BULK_SHM_ADDR) = reply.regs[0];
 
         // 3. Tell VFS to map our SHM
-        msg = TronaMsg::zeroed();
-        reply = TronaMsg::zeroed();
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
         msg.label = VFS_BULK_SETUP;
         msg.regs[0] = shm_id;
         msg.regs[1] = BULK_SHM_PAGES;
         msg.length = 2;
         crate::ipc_call_retry(vfs_ep, &raw const msg, &raw mut reply);
         if reply.label != TRONA_OK {
-            // Non-fatal: fall back to legacy reads
-            return false;
+            return finish_bulk_shm_setup(false);
         }
 
-        *(&raw mut BULK_SHM_READY) = true;
-        true
+        finish_bulk_shm_setup(true)
     }
 }
 
@@ -97,10 +136,9 @@ pub(crate) unsafe fn bulk_read(fd: i32, buf: *mut u8, count: u64) -> Option<usiz
             return None;
         }
 
-        let shm_addr = *(&raw const BULK_SHM_ADDR);
+        let shm_addr = BULK_SHM_ADDR.load(Ordering::Acquire);
         let shm_size = BULK_SHM_PAGES * 4096;
-        let ctx = crate::tls::current_ipc_ctx();
-        let vfs_ep = super::CAP_VFS_EP;
+        let vfs_ep = trona::caps::vfs_ep();
         let mut total = 0u64;
 
         while total < count {
@@ -153,10 +191,9 @@ pub(crate) unsafe fn bulk_pwrite(fd: i32, buf: *const u8, count: u64, offset: u6
             return None;
         }
 
-        let shm_addr = *(&raw const BULK_SHM_ADDR);
+        let shm_addr = BULK_SHM_ADDR.load(Ordering::Acquire);
         let shm_size = BULK_SHM_PAGES * 4096;
-        let ctx = crate::tls::current_ipc_ctx();
-        let vfs_ep = super::CAP_VFS_EP;
+        let vfs_ep = trona::caps::vfs_ep();
         let mut total = 0u64;
 
         while total < count {

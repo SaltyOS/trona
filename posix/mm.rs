@@ -4,39 +4,12 @@
 //! All page allocation (brk/sbrk/mmap/munmap/mprotect) is delegated to the
 //! centralized memory server (mmsrv) via IPC.  fd-backed mmap (file, mount,
 //! device) uses MM_FILE_MMAP; mmsrv resolves the fd backing via
-//! VFS_RESOLVE_BACKING and maps pages directly into the client's VSpace.
+//! VFS_BACKEND_RESOLVE_BACKING and maps pages directly into the client's VSpace.
 
 use trona::consts::kernel::*;
 use trona::consts::posix::*;
 use trona::protocol::*;
 use trona::types::core::*;
-
-/// mmsrv endpoint cap. Set by `posix_mm_init`.
-static mut MMSRV_EP: Cap = 0;
-
-/// Whether the memory manager has been initialized.
-static mut MM_INITIALIZED: bool = false;
-
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
-
-/// Initialize the memory manager with the mmsrv endpoint capability.
-///
-/// # Safety
-/// Must be called exactly once during process startup.
-pub unsafe fn posix_mm_init(mmsrv_ep: Cap) {
-    unsafe {
-        *(&raw mut MMSRV_EP) = mmsrv_ep;
-        *(&raw mut MM_INITIALIZED) = mmsrv_ep != 0;
-    }
-}
-
-/// Return the mmsrv endpoint cap (0 if not initialized).
-pub fn mmsrv_ep() -> Cap {
-    // SAFETY: read-only access to a Cap (u64) that is set once during init.
-    unsafe { *(&raw const MMSRV_EP) }
-}
 
 // ---------------------------------------------------------------------------
 // brk / sbrk
@@ -46,7 +19,8 @@ pub fn mmsrv_ep() -> Cap {
 /// Returns 0 on success, -1 on error.
 pub unsafe fn posix_brk(addr: u64) -> i32 {
     unsafe {
-        if !*(&raw const MM_INITIALIZED) {
+        let mmsrv = trona::caps::mmsrv_ep();
+        if mmsrv == 0 {
             return -1;
         }
         let mut msg = TronaMsg::zeroed();
@@ -55,7 +29,7 @@ pub unsafe fn posix_brk(addr: u64) -> i32 {
         msg.length = 1;
         msg.regs[0] = addr;
         let err = crate::ipc_call_retry(
-            *(&raw const MMSRV_EP),
+            mmsrv,
             &raw const msg,
             &raw mut reply,
         );
@@ -67,7 +41,8 @@ pub unsafe fn posix_brk(addr: u64) -> i32 {
 /// Returns the previous break address on success, or `u64::MAX` on error.
 pub unsafe fn posix_sbrk(increment: i64) -> u64 {
     unsafe {
-        if !*(&raw const MM_INITIALIZED) {
+        let mmsrv = trona::caps::mmsrv_ep();
+        if mmsrv == 0 {
             return u64::MAX;
         }
         let mut msg = TronaMsg::zeroed();
@@ -76,7 +51,7 @@ pub unsafe fn posix_sbrk(increment: i64) -> u64 {
         msg.length = 1;
         msg.regs[0] = increment as u64;
         let err = crate::ipc_call_retry(
-            *(&raw const MMSRV_EP),
+            mmsrv,
             &raw const msg,
             &raw mut reply,
         );
@@ -96,7 +71,7 @@ pub unsafe fn posix_sbrk(increment: i64) -> u64 {
 ///
 /// - **Anonymous** (`MAP_ANONYMOUS`): delegates to mmsrv via `MM_MMAP`.
 /// - **fd-backed** (`fd >= 0`): delegates to mmsrv via `MM_FILE_MMAP`.
-///   mmsrv resolves the fd backing via VFS_RESOLVE_BACKING and maps
+///   mmsrv resolves the fd backing via VFS_BACKEND_RESOLVE_BACKING and maps
 ///   pages directly into the client's VSpace (file, mount, device).
 ///
 /// Returns the mapped base address, or `MAP_FAILED` (usize::MAX) on error.
@@ -109,7 +84,8 @@ pub unsafe fn posix_mmap(
     offset: i64,
 ) -> *mut u8 {
     unsafe {
-        if !*(&raw const MM_INITIALIZED) || length == 0 {
+        let mmsrv = trona::caps::mmsrv_ep();
+        if mmsrv == 0 || length == 0 {
             return usize::MAX as *mut u8;
         }
 
@@ -129,7 +105,7 @@ pub unsafe fn posix_mmap(
             msg.regs[4] = flags as u64;
             msg.regs[5] = addr as u64;
             let err = crate::ipc_call_retry(
-                *(&raw const MMSRV_EP),
+                mmsrv,
                 &raw const msg,
                 &raw mut reply,
             );
@@ -153,7 +129,7 @@ pub unsafe fn posix_mmap(
         msg.regs[2] = prot as u64;
         msg.regs[3] = flags as u64;
         let err = crate::ipc_call_retry(
-            *(&raw const MMSRV_EP),
+            mmsrv,
             &raw const msg,
             &raw mut reply,
         );
@@ -165,11 +141,51 @@ pub unsafe fn posix_mmap(
     }
 }
 
+/// Materialize a current-process range through mmsrv before first use.
+pub unsafe fn posix_prefault(addr: *mut u8, length: u64, prot: i32) -> i32 {
+    unsafe {
+        let mmsrv = trona::caps::mmsrv_ep();
+        if mmsrv == 0 || length == 0 {
+            return -1;
+        }
+
+        let pid = crate::proc::posix_getpid();
+        if pid <= 0 {
+            return -1;
+        }
+
+        let start = (addr as u64) & !0xFFFu64;
+        let end = match (addr as u64).checked_add(length).and_then(|v| v.checked_add(4095)) {
+            Some(v) => v & !0xFFFu64,
+            None => return -1,
+        };
+        if end <= start {
+            return -1;
+        }
+
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = MM_PREFAULT_RANGE;
+        msg.length = 4;
+        msg.regs[0] = pid as u64;
+        msg.regs[1] = start;
+        msg.regs[2] = (end - start) / 4096;
+        msg.regs[3] = prot as u64;
+        let err = crate::ipc_call_retry(
+            mmsrv,
+            &raw const msg,
+            &raw mut reply,
+        );
+        if err != 0 || reply.label != TRONA_OK { -1 } else { 0 }
+    }
+}
+
 /// Unmap a previously mmap'd region.
 /// All regions (anonymous, file-backed, device) are managed by mmsrv.
 pub unsafe fn posix_munmap(addr: *mut u8, length: u64) -> i32 {
     unsafe {
-        if !*(&raw const MM_INITIALIZED) {
+        let mmsrv = trona::caps::mmsrv_ep();
+        if mmsrv == 0 {
             return -1;
         }
 
@@ -180,7 +196,7 @@ pub unsafe fn posix_munmap(addr: *mut u8, length: u64) -> i32 {
         msg.regs[0] = addr as u64;
         msg.regs[1] = length;
         let err = crate::ipc_call_retry(
-            *(&raw const MMSRV_EP),
+            mmsrv,
             &raw const msg,
             &raw mut reply,
         );
@@ -192,7 +208,8 @@ pub unsafe fn posix_munmap(addr: *mut u8, length: u64) -> i32 {
 /// Returns 0 on success, -1 on error.
 pub unsafe fn posix_mprotect(addr: *mut u8, length: u64, prot: i32) -> i32 {
     unsafe {
-        if !*(&raw const MM_INITIALIZED) {
+        let mmsrv = trona::caps::mmsrv_ep();
+        if mmsrv == 0 {
             return -1;
         }
         let mut msg = TronaMsg::zeroed();
@@ -203,7 +220,7 @@ pub unsafe fn posix_mprotect(addr: *mut u8, length: u64, prot: i32) -> i32 {
         msg.regs[1] = length;
         msg.regs[2] = prot as u64;
         let err = crate::ipc_call_retry(
-            *(&raw const MMSRV_EP),
+            mmsrv,
             &raw const msg,
             &raw mut reply,
         );

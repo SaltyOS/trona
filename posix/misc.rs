@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! POSIX fcntl, isatty, ioctl, chdir, getcwd, tcgetattr, shm operations.
 
-use super::{pack_path, CAP_VFS_EP};
+use super::pack_path;
 use trona::consts::kernel::*;
 use trona::consts::posix::*;
 use trona::protocol::*;
@@ -119,7 +119,7 @@ pub unsafe fn posix_net_get_config(result: *mut [u64; 9]) -> i32 {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
         msg.label = NET_GET_CONFIG;
-        let err = crate::ipc_call_retry_idempotent(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -142,13 +142,13 @@ pub unsafe fn posix_fcntl(fd: i32, cmd: i32, arg: i64) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_FCNTL;
+        msg.label = VFS_POSIX_FCNTL;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = cmd as u64;
         msg.regs[2] = arg as u64;
 
-        let err = crate::ipc_call_retry_idempotent(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -164,11 +164,11 @@ pub unsafe fn posix_isatty(fd: i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_ISATTY;
+        msg.label = VFS_POSIX_ISATTY;
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
-        let err = crate::ipc_call_retry_idempotent(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -184,13 +184,13 @@ pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_IOCTL;
+        msg.label = VFS_POSIX_IOCTL;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = request;
         msg.regs[2] = arg;
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -267,6 +267,13 @@ pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
                     return 0;
                 }
             }
+            TIOCGSID | TIOCGPTN => {
+                if arg != 0 {
+                    let value_p = arg as *mut i32;
+                    *value_p = reply.regs[0] as i32;
+                    return 0;
+                }
+            }
             TIOCGWINSZ => {
                 if arg != 0 {
                     let rows = if reply.length >= 1 { reply.regs[0] } else { 0 };
@@ -280,6 +287,9 @@ pub unsafe fn posix_ioctl(fd: i32, request: u64, arg: u64) -> i32 {
                     return 0;
                 }
             }
+            TIOCSWINSZ => {
+                return 0;
+            }
             _ => {}
         }
         reply.regs[0] as i32
@@ -292,11 +302,11 @@ pub unsafe fn posix_chdir(path: *const u8) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_CHDIR;
+        msg.label = VFS_POSIX_CHDIR;
         let path_len = pack_path(&raw mut msg, 0, path, 128);
         msg.length = 1 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -317,11 +327,11 @@ pub unsafe fn posix_getcwd(buf: *mut u8, size: u64) -> i32 {
 
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_GETCWD;
+        msg.label = VFS_POSIX_GETCWD;
         msg.length = 1;
         msg.regs[0] = size;
 
-        let err = crate::ipc_call_retry_idempotent(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -354,11 +364,11 @@ pub unsafe fn posix_tcgetattr(fd: i32, termios_p: *mut Termios) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_TCGETATTR;
+        msg.label = VFS_POSIX_TCGETATTR;
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
-        let err = crate::ipc_call_retry_idempotent(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -395,7 +405,7 @@ pub unsafe fn posix_tcsetattr(
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_TCSETATTR;
+        msg.label = VFS_POSIX_TCSETATTR;
         msg.length = 11;
         msg.regs[0] = fd as u64;
         msg.regs[1] = action as u64;
@@ -411,7 +421,7 @@ pub unsafe fn posix_tcsetattr(
             *dst.add(i) = (*termios_p).c_cc[i];
         }
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -424,24 +434,18 @@ pub unsafe fn posix_tcsetattr(
 
 /// Open a POSIX shared memory object by `name` (e.g. "/myshm").
 ///
-/// Strips the leading '/' per POSIX convention before sending to VFS.
+/// The VFS shm API expects the POSIX form including the leading '/'.
 /// Returns the shm fd on success, -1 on error.
 pub unsafe fn posix_shm_open(name: *const u8, flags: i32) -> i32 {
     unsafe {
-        // POSIX: shm names are "/name"; strip leading '/' before sending bare name to VFS
-        let bare = if !name.is_null() && *name == b'/' {
-            name.add(1)
-        } else {
-            name
-        };
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_SHM_OPEN;
+        msg.label = VFS_POSIX_SHM_OPEN;
         msg.regs[0] = flags as u64;
-        let name_len = pack_path(&raw mut msg, 1, bare, 128);
+        let name_len = pack_path(&raw mut msg, 1, name, 128);
         msg.length = 2 + ((name_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -456,19 +460,13 @@ pub unsafe fn posix_shm_open(name: *const u8, flags: i32) -> i32 {
 /// Returns 0 on success, -1 on error.
 pub unsafe fn posix_shm_unlink(name: *const u8) -> i32 {
     unsafe {
-        // POSIX: shm names are "/name"; strip leading '/' before sending bare name to VFS
-        let bare = if !name.is_null() && *name == b'/' {
-            name.add(1)
-        } else {
-            name
-        };
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_SHM_UNLINK;
-        let name_len = pack_path(&raw mut msg, 0, bare, 128);
+        msg.label = VFS_POSIX_SHM_UNLINK;
+        let name_len = pack_path(&raw mut msg, 0, name, 128);
         msg.length = 1 + ((name_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -481,18 +479,18 @@ pub unsafe fn posix_shm_unlink(name: *const u8) -> i32 {
 
 /// Framebuffer ioctl wrapper.
 ///
-/// Sends VFS_IOCTL with an fb-specific command and unpacks up to 5 result registers.
+/// Sends VFS_POSIX_IOCTL with an fb-specific command and unpacks up to 5 result registers.
 pub unsafe fn posix_fb_ioctl(fd: i32, cmd: u64, result: *mut [u64; 5]) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_IOCTL;
+        msg.label = VFS_POSIX_IOCTL;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = cmd;
         msg.regs[2] = 0;
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -530,8 +528,7 @@ pub unsafe fn posix_umask(mask: u32) -> u32 {
         msg.length = 1;
         msg.regs[0] = mask as u64;
 
-        let cap_procmgr: u64 = 3; // CAP_PROCMGR_EP
-        let err = crate::ipc_call_retry(cap_procmgr, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
         let old = if err != 0 || reply.label != TRONA_OK {
             let prev = ::core::ptr::read_volatile(&raw const UMASK_CACHE);
             ::core::ptr::write_volatile(&raw mut UMASK_CACHE, mask & 0o777);
@@ -550,12 +547,12 @@ pub unsafe fn posix_fchmod(fd: i32, mode: u32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_FCHMOD;
+        msg.label = VFS_POSIX_FCHMOD;
         msg.length = 2;
         msg.regs[0] = fd as u64;
         msg.regs[1] = mode as u64;
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }
@@ -572,13 +569,13 @@ pub unsafe fn posix_fchown(fd: i32, uid: u32, gid: u32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = VFS_FCHOWN;
+        msg.label = VFS_POSIX_FCHOWN;
         msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = uid as u64;
         msg.regs[2] = gid as u64;
 
-        let err = crate::ipc_call_retry(CAP_VFS_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
         if err != 0 {
             return super::call_err_to_posix(err);
         }

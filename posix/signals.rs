@@ -4,7 +4,8 @@
 //! Two delivery mechanisms:
 //!
 //! 1. **Cooperative polling** (`posix_sigcheck`): userspace explicitly polls
-//!    `CAP_SIGNAL_NTFN` for pending signal bits and dispatches handlers.
+//!    the signal notification (`caps::signal_ntfn()`) for pending signal bits
+//!    and dispatches handlers.
 //!
 //! 2. **Kernel-injected notification frame** (`__signal_dispatcher`): when a
 //!    blocking IPC Call is interrupted by a bound notification, the kernel
@@ -22,10 +23,6 @@ use trona::protocol::*;
 use trona::types::core::*;
 use trona::types::posix::*;
 use ::core::sync::atomic::Ordering;
-
-// Standard child CSpace layout
-const CAP_PROCMGR_EP: u64 = 3;
-const CAP_SIGNAL_NTFN: u64 = 6;
 
 /// Magic value matching the kernel's `NOTIFFRAME_MAGIC`.
 const NOTIFFRAME_MAGIC: u64 = 0x5A17_5349_4746_524D;
@@ -103,7 +100,7 @@ unsafe fn sig_init() {
         .is_ok()
     {
         // Bind signal notification to our TCB (enables kernel wakeup on signal)
-        trona::invoke::tcb_bind_notification(CAP_SELF_TCB, CAP_SIGNAL_NTFN);
+        trona::invoke::tcb_bind_notification(CAP_SELF_TCB, trona::caps::signal_ntfn());
         // Register signal dispatcher (enables signal frame injection)
         trona::invoke::tcb_set_notification_dispatcher(
             CAP_SELF_TCB,
@@ -166,7 +163,7 @@ pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
         msg.regs[0] = sig as u64;
         msg.regs[1] = disp;
 
-        let err = crate::ipc_call_retry(CAP_PROCMGR_EP, &raw const msg, &raw mut reply);
+        let err = crate::ipc_call_retry(trona::caps::procmgr_ep(), &raw const msg, &raw mut reply);
         if err != 0 || reply.label != TRONA_OK {
             // Revert on failure
             crate::__sig_handlers[sig as usize].store(old, Ordering::SeqCst);
@@ -179,7 +176,7 @@ pub unsafe fn posix_signal(sig: i32, handler: usize) -> usize {
 
 /// Poll for pending signals and dispatch handlers.
 ///
-/// Polls `CAP_SIGNAL_NTFN` for signal bits. For each pending signal:
+/// Polls the signal notification for signal bits. For each pending signal:
 /// - If blocked: re-raises it via `SYS_SIGNAL` so it stays pending.
 /// - If SIG_IGN: silently consumed.
 /// - If SIG_DFL with terminate action: calls `posix_exit(128 + sig)`.
@@ -196,8 +193,11 @@ pub unsafe fn posix_sigcheck() -> i32 {
     unsafe {
         sig_init();
 
+        let sig_ntfn = trona::caps::signal_ntfn();
+        let procmgr_ep = trona::caps::procmgr_ep();
+
         let mut bits: u64 = 0;
-        let r = trona::syscall::syscall(SYS_POLL, CAP_SIGNAL_NTFN, 0, 0, 0, 0, 0);
+        let r = trona::syscall::syscall(SYS_POLL, sig_ntfn, 0, 0, 0, 0, 0);
         let err = r.error as i32;
         if err == 0 {
             bits = r.value;
@@ -247,7 +247,7 @@ pub unsafe fn posix_sigcheck() -> i32 {
                     msg.regs[1] = SIG_DISP_DFL;
                     let _ = trona::ipc::call_ctx(
                         crate::tls::current_ipc_ctx(),
-                        CAP_PROCMGR_EP,
+                        procmgr_ep,
                         &raw const msg,
                         &raw mut reply,
                     );
@@ -265,7 +265,7 @@ pub unsafe fn posix_sigcheck() -> i32 {
 
         // Re-raise blocked signals so they remain pending
         if repost != 0 {
-            trona::syscall::syscall(SYS_SIGNAL, CAP_SIGNAL_NTFN, repost, 0, 0, 0, 0);
+            trona::syscall::syscall(SYS_SIGNAL, sig_ntfn, repost, 0, 0, 0, 0);
         }
 
         dispatched
@@ -280,6 +280,9 @@ pub unsafe fn posix_sigcheck() -> i32 {
 /// delivered signals had `SA_RESTART` set.
 unsafe fn dispatch_signal_bits(bits: u64) -> i32 {
     unsafe {
+        let sig_ntfn = trona::caps::signal_ntfn();
+        let procmgr_ep = trona::caps::procmgr_ep();
+
         let blocked = *(&raw const crate::__sig_blocked_mask);
         let mut repost: u64 = 0;
         let mut dispatched: i32 = 0;
@@ -318,7 +321,7 @@ unsafe fn dispatch_signal_bits(bits: u64) -> i32 {
                     msg.regs[1] = SIG_DISP_DFL;
                     let _ = trona::ipc::call_ctx(
                         crate::tls::current_ipc_ctx(),
-                        CAP_PROCMGR_EP,
+                        procmgr_ep,
                         &raw const msg,
                         &raw mut reply,
                     );
@@ -337,7 +340,7 @@ unsafe fn dispatch_signal_bits(bits: u64) -> i32 {
         }
 
         if repost != 0 {
-            trona::syscall::syscall(SYS_SIGNAL, CAP_SIGNAL_NTFN, repost, 0, 0, 0, 0);
+            trona::syscall::syscall(SYS_SIGNAL, sig_ntfn, repost, 0, 0, 0, 0);
         }
 
         // Record whether all delivered signals had SA_RESTART

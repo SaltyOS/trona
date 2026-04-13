@@ -15,7 +15,6 @@
 //! - **`mm`** -- Memory management (mmap, munmap, shm)
 //! - **`signals`** -- POSIX signal delivery via notifications
 //! - **`pthread`** -- POSIX threads (create, join, exit, detach, mutex, key)
-//! - **`sync`** -- Synchronization primitives (Mutex, RWLock, Semaphore, Condvar)
 //! - **`tls`** -- Thread-Local Storage block layout and accessors
 //! - **`dns`** -- DNS hostname resolution client
 //! - **`at`** -- *at() family (openat, fstatat, etc.)
@@ -47,7 +46,6 @@ pub mod mm;
 pub mod dns;
 pub mod signals;
 pub mod pthread;
-pub mod sync;
 pub mod tls;
 
 pub use file::*;
@@ -70,9 +68,12 @@ pub(crate) fn trona_err_to_posix(label: u64) -> i32 {
         TRONA_OK => 0,
         TRONA_NOT_FOUND => -2,                // ENOENT
         TRONA_ALREADY_EXISTS => -17,           // EEXIST
+        TRONA_SLOT_OCCUPIED => -17,            // EEXIST
+        TRONA_ALREADY_MAPPED => -17,           // EEXIST
         TRONA_INVALID_ARGUMENT => -22,         // EINVAL
         TRONA_OUT_OF_MEMORY => -12,            // ENOMEM
         TRONA_BUSY => -16,                     // EBUSY
+        TRONA_ALREADY_BOUND => -16,            // EBUSY
         TRONA_WOULD_BLOCK => -11,              // EAGAIN
         TRONA_IN_PROGRESS => -115,            // EINPROGRESS
         TRONA_BAD_ADDRESS => -14,              // EFAULT
@@ -288,7 +289,7 @@ pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
         msg.length = 10;
 
         let err = crate::ipc_call_retry(
-            CAP_PROCMGR_EP,
+            trona::caps::procmgr_ep(),
             &raw const msg,
             &raw mut reply,
         );
@@ -357,6 +358,11 @@ pub extern "C" fn trona_shm_unlink(name: *const u8) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn trona_ftruncate(fd: i32, length: u64) -> i32 {
     unsafe { file::posix_ftruncate(fd, length) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn trona_fsync(fd: i32) -> i32 {
+    unsafe { file::posix_fsync(fd) }
 }
 
 // ---------------------------------------------------------------------------
