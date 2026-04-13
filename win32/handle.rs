@@ -54,26 +54,33 @@ impl HandleEntry {
 static mut HANDLE_TABLE: [HandleEntry; MAX_HANDLES] = [HandleEntry::zeroed(); MAX_HANDLES];
 static mut HANDLE_TABLE_INIT: bool = false;
 
+unsafe fn seed_std_handles() {
+    unsafe {
+        let table = &raw mut HANDLE_TABLE;
+        for i in 0..MAX_HANDLES {
+            (*table)[i] = HandleEntry::zeroed();
+        }
+        (*table)[0] = HandleEntry { kind: HandleKind::VfsFd, vfs_fd: 0, cap_slot: 0 };
+        (*table)[1] = HandleEntry { kind: HandleKind::VfsFd, vfs_fd: 1, cap_slot: 0 };
+        (*table)[2] = HandleEntry { kind: HandleKind::VfsFd, vfs_fd: 2, cap_slot: 0 };
+    }
+}
+
 /// Initialize the handle table with standard I/O handles.
 /// Slot 0 = stdin (VFS fd 0), Slot 1 = stdout (VFS fd 1), Slot 2 = stderr (VFS fd 2).
 pub unsafe fn init_handle_table() {
     unsafe {
-        let table = &raw mut HANDLE_TABLE;
-        (*table)[0] = HandleEntry {
-            kind: HandleKind::VfsFd,
-            vfs_fd: 0,
-            cap_slot: 0,
-        };
-        (*table)[1] = HandleEntry {
-            kind: HandleKind::VfsFd,
-            vfs_fd: 1,
-            cap_slot: 0,
-        };
-        (*table)[2] = HandleEntry {
-            kind: HandleKind::VfsFd,
-            vfs_fd: 2,
-            cap_slot: 0,
-        };
+        if *(&raw const HANDLE_TABLE_INIT) {
+            return;
+        }
+        seed_std_handles();
+        *(&raw mut HANDLE_TABLE_INIT) = true;
+    }
+}
+
+pub unsafe fn reset_handle_table() {
+    unsafe {
+        seed_std_handles();
         *(&raw mut HANDLE_TABLE_INIT) = true;
     }
 }

@@ -13,5 +13,4 @@ EXPORTS
   SetLastError
   WriteConsoleA
   WriteConsoleW
-  __trona_ipc_ctx DATA
-  __win32srv_ep DATA
+  kernel32_runtime_init

@@ -4,7 +4,8 @@
 // Per-thread last-error code, stored in a static (single-threaded for now).
 // Maps TRONA_* error codes to Win32 DWORD error codes.
 
-use crate::handle::{DWORD, BOOL, TRUE, FALSE};
+use crate::handle::{BOOL, DWORD, FALSE, TRUE};
+use crate::trona;
 
 // Win32 error codes
 pub const ERROR_SUCCESS: DWORD = 0;
@@ -23,7 +24,7 @@ static mut LAST_ERROR: DWORD = 0;
 
 /// Map a TRONA error code to a Win32 error code.
 pub fn trona_to_win32_error(trona_err: u64) -> DWORD {
-    use trona::consts::kernel::*;
+    use crate::trona::consts::kernel::*;
     match trona_err {
         TRONA_OK => ERROR_SUCCESS,
         TRONA_INVALID_CAPABILITY => ERROR_INVALID_HANDLE,
@@ -34,6 +35,9 @@ pub fn trona_to_win32_error(trona_err: u64) -> DWORD {
         TRONA_NOT_FOUND => ERROR_FILE_NOT_FOUND,
         TRONA_BUSY => ERROR_BUSY,
         TRONA_ALREADY_EXISTS => ERROR_ALREADY_EXISTS,
+        TRONA_SLOT_OCCUPIED => ERROR_ALREADY_EXISTS,
+        TRONA_ALREADY_MAPPED => ERROR_ALREADY_EXISTS,
+        TRONA_ALREADY_BOUND => ERROR_BUSY,
         _ => ERROR_INVALID_FUNCTION,
     }
 }
