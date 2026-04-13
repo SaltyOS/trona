@@ -1,18 +1,73 @@
-//! Synchronization primitives: Mutex, Condvar, RWLock, Barrier, Once
+//! Synchronization primitives: Mutex, Condvar, RWLock, Barrier, Semaphore, Once
 //!
-//! All implemented as pure userspace constructs on top of the kernel futex
-//! syscall. No kernel objects are consumed for synchronization.
+//! Subsystem-neutral, futex-based userspace synchronization. No kernel
+//! objects are consumed — every primitive is a single atomic word plus
+//! `futex_wait`/`futex_wake` syscalls on contention.
+//!
+//! This module intentionally returns substrate-level status codes
+//! (`TRONA_OK`, `TRONA_BUSY`, `TRONA_DEADLOCK`, `TRONA_TIMED_OUT`,
+//! `TRONA_INVALID_OPERATION`) rather than any particular subsystem's error
+//! numbering. Each personality layer converts these into its own error
+//! surface (POSIX errno, NT status, etc.).
+//!
+//! # Cancellation
+//!
+//! Blocking primitives (`Condvar::wait`, typed variants) observe a
+//! `cancel_pending` flag on the current thread's TLS block and invoke
+//! a runtime-installed hook if set. Subsystems that support cancellation
+//! install the hook via `install_cancel_hook()`. If no hook is installed,
+//! cancellation is a no-op — suitable for bare services that have no
+//! cancellation concept.
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-use trona::syscall::{futex_wait, futex_wait_timeout, futex_wake};
-use ::core::sync::atomic::{AtomicU32, Ordering};
+use crate::syscall::{
+    futex_wait as sys_futex_wait,
+    futex_wait_timeout as sys_futex_wait_timeout,
+    futex_wake as sys_futex_wake,
+};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+static MUTEX_SLOWPATH_COUNT: AtomicU64 = AtomicU64::new(0);
+static FUTEX_WAIT_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+static FUTEX_WAKE_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn futex_wait(addr: *const u32, expected: u32) -> u64 {
+    FUTEX_WAIT_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    sys_futex_wait(addr, expected)
+}
+
+#[inline]
+fn futex_wait_timeout(addr: *const u32, expected: u32, timeout_ns: u64) -> u64 {
+    FUTEX_WAIT_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    sys_futex_wait_timeout(addr, expected, timeout_ns)
+}
+
+#[inline]
+fn futex_wake(addr: *const u32, count: u32) -> u64 {
+    FUTEX_WAKE_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    sys_futex_wake(addr, count)
+}
+
+#[inline]
+fn note_mutex_slowpath() {
+    MUTEX_SLOWPATH_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn debug_lock_stats() -> (u64, u64, u64) {
+    (
+        MUTEX_SLOWPATH_COUNT.load(Ordering::Relaxed),
+        FUTEX_WAIT_CALL_COUNT.load(Ordering::Relaxed),
+        FUTEX_WAKE_CALL_COUNT.load(Ordering::Relaxed),
+    )
+}
 
 #[inline]
 fn monotonic_now_ns() -> u64 {
-    trona::syscall::syscall(
-        trona::consts::kernel::SYS_CLOCK_GETTIME,
-        trona::consts::kernel::CLOCK_MONOTONIC as u64,
+    crate::syscall::syscall(
+        crate::consts::kernel::SYS_CLOCK_GETTIME,
+        crate::consts::kernel::CLOCK_MONOTONIC as u64,
         0,
         0,
         0,
@@ -46,6 +101,49 @@ fn clear_blocked_futex() {
         // SAFETY: tls is a valid pointer to the current thread's TLS block
         unsafe {
             (*tls).blocked_futex_addr.store(0, Ordering::Release);
+        }
+    }
+}
+
+// =========================================================================
+// Cancellation hook (subsystem-neutral)
+// =========================================================================
+
+/// Cancellation callback pointer. `0` means no hook installed.
+///
+/// Stored as `usize` because `AtomicPtr<fn()>` is painful in no_std contexts.
+/// Cast back to `unsafe fn()` via `core::mem::transmute` when invoking.
+static CANCEL_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install a cancellation callback into the substrate sync layer.
+///
+/// The hook is called by blocking primitives (`Condvar::wait` and its
+/// variants) after they observe a `cancel_pending` flag on the current
+/// thread's TLS block. Subsystems that implement thread cancellation
+/// install a hook that performs their cleanup and exit protocol.
+///
+/// # Safety
+///
+/// `hook` must remain a valid function pointer for the lifetime of the
+/// process. Typically installed once during subsystem init and never
+/// replaced.
+pub unsafe fn install_cancel_hook(hook: unsafe fn()) {
+    CANCEL_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Run the installed cancellation hook if `cancel_pending` is set on the
+/// current thread. No-op if no hook is installed.
+fn check_cancellation() {
+    if let Some(tls) = crate::tls::current_tls() {
+        unsafe {
+            let pending = ::core::ptr::read_volatile(&raw const (*tls).cancel_pending);
+            if pending != 0 && (*tls).cancel_state == 0 {
+                let hook_addr = CANCEL_HOOK.load(Ordering::Acquire);
+                if hook_addr != 0 {
+                    let f: unsafe fn() = core::mem::transmute(hook_addr);
+                    f();
+                }
+            }
         }
     }
 }
@@ -86,6 +184,7 @@ impl Mutex {
         if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             return;
         }
+        note_mutex_slowpath();
 
         // Spin phase: try to acquire without entering the kernel.
         // On SMP, the holder may be running on another CPU and about to
@@ -115,6 +214,7 @@ impl Mutex {
         if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             return true;
         }
+        note_mutex_slowpath();
 
         // Slow path: always swap(2) to preserve waiter flag
         let deadline_ns = monotonic_now_ns().saturating_add(timeout_ns);
@@ -131,7 +231,7 @@ impl Mutex {
             }
 
             let err = futex_wait_timeout(self.futex_ptr(), 2, remaining_ns);
-            if err == trona::consts::kernel::TRONA_CANCELLED {
+            if err == crate::consts::kernel::TRONA_CANCELLED {
                 // Timeout — last try with swap(2)
                 return self.state.swap(2, Ordering::Acquire) == 0;
             }
@@ -208,8 +308,11 @@ impl TypedMutex {
         }
     }
 
-    /// Lock the typed mutex. Returns 0 on success, errno on error.
-    pub fn lock(&self) -> i32 {
+    /// Lock the typed mutex.
+    ///
+    /// Returns `TRONA_OK` on success or a substrate status code:
+    /// `TRONA_DEADLOCK` (ERRORCHECK re-entry).
+    pub fn lock(&self) -> u64 {
         let tid = Self::current_thread_id();
 
         match self.mutex_type {
@@ -217,75 +320,81 @@ impl TypedMutex {
                 // If already owned by this thread, just increment count
                 if self.owner.load(Ordering::Relaxed) == tid {
                     self.count.fetch_add(1, Ordering::Relaxed);
-                    return 0;
+                    return crate::consts::kernel::TRONA_OK;
                 }
                 self.lock_inner();
                 self.owner.store(tid, Ordering::Relaxed);
                 self.count.store(1, Ordering::Relaxed);
-                0
+                crate::consts::kernel::TRONA_OK
             }
             MUTEX_ERRORCHECK => {
-                // If already owned by this thread, return EDEADLK
+                // If already owned by this thread, error out
                 if self.owner.load(Ordering::Relaxed) == tid {
-                    return 35; // EDEADLK
+                    return crate::consts::kernel::TRONA_DEADLOCK;
                 }
                 self.lock_inner();
                 self.owner.store(tid, Ordering::Relaxed);
-                0
+                crate::consts::kernel::TRONA_OK
             }
             _ => {
                 self.lock_inner();
-                0
+                crate::consts::kernel::TRONA_OK
             }
         }
     }
 
-    /// Try to lock the typed mutex. Returns 0 on success, errno on error.
-    pub fn try_lock(&self) -> i32 {
+    /// Try to lock the typed mutex without blocking.
+    ///
+    /// Returns `TRONA_OK` on success, `TRONA_BUSY` if the lock is held by
+    /// another thread (or by this thread for ERRORCHECK).
+    pub fn try_lock(&self) -> u64 {
         let tid = Self::current_thread_id();
 
         match self.mutex_type {
             MUTEX_RECURSIVE => {
                 if self.owner.load(Ordering::Relaxed) == tid {
                     self.count.fetch_add(1, Ordering::Relaxed);
-                    return 0;
+                    return crate::consts::kernel::TRONA_OK;
                 }
                 if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                     self.owner.store(tid, Ordering::Relaxed);
                     self.count.store(1, Ordering::Relaxed);
-                    0
+                    crate::consts::kernel::TRONA_OK
                 } else {
-                    16 // EBUSY
+                    crate::consts::kernel::TRONA_BUSY
                 }
             }
             MUTEX_ERRORCHECK => {
                 if self.owner.load(Ordering::Relaxed) == tid {
-                    return 16; // EBUSY
+                    return crate::consts::kernel::TRONA_BUSY;
                 }
                 if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                     self.owner.store(tid, Ordering::Relaxed);
-                    0
+                    crate::consts::kernel::TRONA_OK
                 } else {
-                    16 // EBUSY
+                    crate::consts::kernel::TRONA_BUSY
                 }
             }
             _ => {
                 if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                    0
+                    crate::consts::kernel::TRONA_OK
                 } else {
-                    16 // EBUSY
+                    crate::consts::kernel::TRONA_BUSY
                 }
             }
         }
     }
 
-    /// Unlock the typed mutex. Returns 0 on success, errno on error.
-    pub fn unlock(&self) -> i32 {
+    /// Unlock the typed mutex.
+    ///
+    /// Returns `TRONA_OK` on success, `TRONA_INVALID_OPERATION` if the
+    /// caller is not the owner (RECURSIVE/ERRORCHECK only).
+    pub fn unlock(&self) -> u64 {
         match self.mutex_type {
             MUTEX_RECURSIVE => {
                 let tid = Self::current_thread_id();
                 if self.owner.load(Ordering::Relaxed) != tid {
-                    return 1; // EPERM
+                    return crate::consts::kernel::TRONA_INVALID_OPERATION;
                 }
                 let prev_count = self.count.fetch_sub(1, Ordering::Relaxed);
                 if prev_count <= 1 {
@@ -294,56 +403,59 @@ impl TypedMutex {
                     self.count.store(0, Ordering::Relaxed);
                     self.unlock_inner();
                 }
-                0
+                crate::consts::kernel::TRONA_OK
             }
             MUTEX_ERRORCHECK => {
                 let tid = Self::current_thread_id();
                 if self.owner.load(Ordering::Relaxed) != tid {
-                    return 1; // EPERM
+                    return crate::consts::kernel::TRONA_INVALID_OPERATION;
                 }
                 self.owner.store(u64::MAX, Ordering::Relaxed);
                 self.unlock_inner();
-                0
+                crate::consts::kernel::TRONA_OK
             }
             _ => {
                 self.unlock_inner();
-                0
+                crate::consts::kernel::TRONA_OK
             }
         }
     }
 
-    /// Lock with timeout. Returns 0 on success, errno on error/timeout.
-    pub fn lock_timeout(&self, timeout_ns: u64) -> i32 {
+    /// Lock with timeout in nanoseconds.
+    ///
+    /// Returns `TRONA_OK` on success, `TRONA_TIMED_OUT` on timeout,
+    /// `TRONA_DEADLOCK` on ERRORCHECK re-entry.
+    pub fn lock_timeout(&self, timeout_ns: u64) -> u64 {
         let tid = Self::current_thread_id();
 
         match self.mutex_type {
             MUTEX_RECURSIVE => {
                 if self.owner.load(Ordering::Relaxed) == tid {
                     self.count.fetch_add(1, Ordering::Relaxed);
-                    return 0;
+                    return crate::consts::kernel::TRONA_OK;
                 }
                 if !self.lock_inner_timeout(timeout_ns) {
-                    return 110; // ETIMEDOUT
+                    return crate::consts::server::TRONA_TIMED_OUT;
                 }
                 self.owner.store(tid, Ordering::Relaxed);
                 self.count.store(1, Ordering::Relaxed);
-                0
+                crate::consts::kernel::TRONA_OK
             }
             MUTEX_ERRORCHECK => {
                 if self.owner.load(Ordering::Relaxed) == tid {
-                    return 35; // EDEADLK
+                    return crate::consts::kernel::TRONA_DEADLOCK;
                 }
                 if !self.lock_inner_timeout(timeout_ns) {
-                    return 110; // ETIMEDOUT
+                    return crate::consts::server::TRONA_TIMED_OUT;
                 }
                 self.owner.store(tid, Ordering::Relaxed);
-                0
+                crate::consts::kernel::TRONA_OK
             }
             _ => {
                 if !self.lock_inner_timeout(timeout_ns) {
-                    110 // ETIMEDOUT
+                    crate::consts::server::TRONA_TIMED_OUT
                 } else {
-                    0
+                    crate::consts::kernel::TRONA_OK
                 }
             }
         }
@@ -354,6 +466,7 @@ impl TypedMutex {
         if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             return;
         }
+        note_mutex_slowpath();
         // Spin phase
         for _ in 0..40 {
             if self.state.load(Ordering::Relaxed) == 0 {
@@ -377,6 +490,7 @@ impl TypedMutex {
         if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             return true;
         }
+        note_mutex_slowpath();
         let deadline_ns = monotonic_now_ns().saturating_add(timeout_ns);
         loop {
             if self.state.swap(2, Ordering::Acquire) == 0 {
@@ -389,7 +503,7 @@ impl TypedMutex {
             }
 
             let err = futex_wait_timeout(self.futex_ptr(), 2, remaining_ns);
-            if err == trona::consts::kernel::TRONA_CANCELLED {
+            if err == crate::consts::kernel::TRONA_CANCELLED {
                 return self.state.swap(2, Ordering::Acquire) == 0;
             }
         }
@@ -490,9 +604,9 @@ impl Condvar {
 
     /// Wait on the condition variable with a timeout in nanoseconds.
     ///
-    /// Returns 0 on successful wake, 110 (ETIMEDOUT) on timeout.
+    /// Returns `TRONA_OK` on successful wake, `TRONA_TIMED_OUT` on timeout.
     /// This is a cancellation point.
-    pub fn wait_timeout(&self, mutex: &Mutex, timeout_ns: u64) -> i32 {
+    pub fn wait_timeout(&self, mutex: &Mutex, timeout_ns: u64) -> u64 {
         let current_seq = self.seq.load(Ordering::Relaxed);
         mutex.unlock();
         set_blocked_futex(self.futex_ptr());
@@ -501,43 +615,55 @@ impl Condvar {
         mutex.lock();
         // Cancellation point: check after re-acquiring mutex
         check_cancellation();
-        if err == trona::consts::kernel::TRONA_CANCELLED { 110 } else { 0 }
+        if err == crate::consts::kernel::TRONA_CANCELLED {
+            crate::consts::server::TRONA_TIMED_OUT
+        } else {
+            crate::consts::kernel::TRONA_OK
+        }
     }
 
     /// Wait on the condition variable with a typed mutex (RECURSIVE/ERRORCHECK).
     ///
     /// Fully releases the mutex (saving recursion count), blocks, then
     /// re-acquires with the original count restored. This is a cancellation point.
-    pub fn wait_typed(&self, mutex: &TypedMutex) -> i32 {
+    ///
+    /// Returns `TRONA_OK` on successful wake, `TRONA_INVALID_OPERATION`
+    /// if the caller does not own the mutex.
+    pub fn wait_typed(&self, mutex: &TypedMutex) -> u64 {
         let current_seq = self.seq.load(Ordering::Relaxed);
         let saved = mutex.condvar_unlock();
         if saved == 0 {
-            return 1; // EPERM — caller doesn't own the mutex
+            return crate::consts::kernel::TRONA_INVALID_OPERATION;
         }
         set_blocked_futex(self.futex_ptr());
         futex_wait(self.futex_ptr(), current_seq);
         clear_blocked_futex();
         mutex.condvar_relock(saved);
         check_cancellation();
-        0
+        crate::consts::kernel::TRONA_OK
     }
 
     /// Wait on the condition variable with a typed mutex and timeout.
     ///
-    /// Returns 0 on successful wake, 110 (ETIMEDOUT) on timeout.
+    /// Returns `TRONA_OK` on successful wake, `TRONA_TIMED_OUT` on timeout,
+    /// `TRONA_INVALID_OPERATION` if the caller does not own the mutex.
     /// This is a cancellation point.
-    pub fn wait_timeout_typed(&self, mutex: &TypedMutex, timeout_ns: u64) -> i32 {
+    pub fn wait_timeout_typed(&self, mutex: &TypedMutex, timeout_ns: u64) -> u64 {
         let current_seq = self.seq.load(Ordering::Relaxed);
         let saved = mutex.condvar_unlock();
         if saved == 0 {
-            return 1; // EPERM — caller doesn't own the mutex
+            return crate::consts::kernel::TRONA_INVALID_OPERATION;
         }
         set_blocked_futex(self.futex_ptr());
         let err = futex_wait_timeout(self.futex_ptr(), current_seq, timeout_ns);
         clear_blocked_futex();
         mutex.condvar_relock(saved);
         check_cancellation();
-        if err == trona::consts::kernel::TRONA_CANCELLED { 110 } else { 0 }
+        if err == crate::consts::kernel::TRONA_CANCELLED {
+            crate::consts::server::TRONA_TIMED_OUT
+        } else {
+            crate::consts::kernel::TRONA_OK
+        }
     }
 
     /// Wake one waiting thread.
@@ -702,7 +828,7 @@ impl RWLock {
             }
             let wake_val = self.writer_wake.load(Ordering::Relaxed);
             let err = futex_wait_timeout(self.writer_futex_ptr(), wake_val, remaining);
-            if err == trona::consts::kernel::TRONA_CANCELLED {
+            if err == crate::consts::kernel::TRONA_CANCELLED {
                 // Timeout — one last try
                 let s2 = self.state.load(Ordering::Relaxed);
                 if s2 & WRITER_BIT == 0 {
@@ -744,7 +870,7 @@ impl RWLock {
                 }
                 let wake_val = self.writer_wake.load(Ordering::Relaxed);
                 let err = futex_wait_timeout(self.writer_futex_ptr(), wake_val, remaining);
-                if err == trona::consts::kernel::TRONA_CANCELLED {
+                if err == crate::consts::kernel::TRONA_CANCELLED {
                     // Timeout — one last try
                     if self.state.compare_exchange(
                         0, WRITER_BIT, Ordering::Acquire, Ordering::Relaxed,
@@ -820,7 +946,7 @@ impl Barrier {
 // Semaphore: futex-based counting semaphore
 // =========================================================================
 
-/// Maximum value for a POSIX semaphore.
+/// Maximum value for a counting semaphore.
 pub const SEM_VALUE_MAX: u32 = i32::MAX as u32;
 
 /// Counting semaphore.
@@ -886,15 +1012,15 @@ impl Semaphore {
     }
 
     /// Decrement with timeout in nanoseconds.
-    /// Returns 0 on success, 110 (ETIMEDOUT) on timeout.
-    pub fn wait_timeout(&self, timeout_ns: u64) -> i32 {
+    /// Returns `TRONA_OK` on success, `TRONA_TIMED_OUT` on timeout.
+    pub fn wait_timeout(&self, timeout_ns: u64) -> u64 {
         // Fast path: uncontended decrement before computing deadline
         let c = self.count.load(Ordering::Relaxed);
         if c > 0 {
             if self.count.compare_exchange_weak(
                 c, c - 1, Ordering::Acquire, Ordering::Relaxed,
             ).is_ok() {
-                return 0;
+                return crate::consts::kernel::TRONA_OK;
             }
         }
         let deadline_ns = monotonic_now_ns().saturating_add(timeout_ns);
@@ -904,7 +1030,7 @@ impl Semaphore {
                 if self.count.compare_exchange_weak(
                     c, c - 1, Ordering::Acquire, Ordering::Relaxed,
                 ).is_ok() {
-                    return 0;
+                    return crate::consts::kernel::TRONA_OK;
                 }
                 continue;
             }
@@ -916,23 +1042,23 @@ impl Semaphore {
                     if self.count.compare_exchange(
                         c2, c2 - 1, Ordering::Acquire, Ordering::Relaxed,
                     ).is_ok() {
-                        return 0;
+                        return crate::consts::kernel::TRONA_OK;
                     }
                 }
-                return 110; // ETIMEDOUT
+                return crate::consts::server::TRONA_TIMED_OUT;
             }
             let err = futex_wait_timeout(self.futex_ptr(), 0, remaining);
-            if err == trona::consts::kernel::TRONA_CANCELLED {
+            if err == crate::consts::kernel::TRONA_CANCELLED {
                 // Last-chance try
                 let c2 = self.count.load(Ordering::Relaxed);
                 if c2 > 0 {
                     if self.count.compare_exchange(
                         c2, c2 - 1, Ordering::Acquire, Ordering::Relaxed,
                     ).is_ok() {
-                        return 0;
+                        return crate::consts::kernel::TRONA_OK;
                     }
                 }
-                return 110; // ETIMEDOUT
+                return crate::consts::server::TRONA_TIMED_OUT;
             }
         }
     }
@@ -1020,24 +1146,5 @@ impl Once {
     #[inline]
     fn futex_ptr(&self) -> *const u32 {
         &self.state as *const AtomicU32 as *const u32
-    }
-}
-
-// =========================================================================
-// Cancellation support
-// =========================================================================
-
-/// Check for pending cancellation at a cancellation point.
-///
-/// If a cancellation is pending and enabled, invokes `pthread_testcancel()`
-/// which runs cleanup handlers and calls `pthread_exit(PTHREAD_CANCELED)`.
-fn check_cancellation() {
-    if let Some(tls) = crate::tls::current_tls() {
-        unsafe {
-            let pending = ::core::ptr::read_volatile(&raw const (*tls).cancel_pending);
-            if pending != 0 && (*tls).cancel_state == 0 {
-                crate::pthread::pthread_testcancel();
-            }
-        }
     }
 }
