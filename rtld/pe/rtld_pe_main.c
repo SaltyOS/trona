@@ -88,8 +88,15 @@ static Elf64_Dyn *find_dynamic(uint64_t base) {
     return NULL;
 }
 
+void __attribute__((noreturn)) pe_exit(int code) {
+    uint64_t msg_info = ((uint64_t)PM_EXIT_LABEL << 12) | 1;
+    pe_syscall(SYS_CALL, g_pe_rtld.cap_procmgr_ep, msg_info,
+               (uint64_t)code, 0, 0, 0);
+    for (;;) pe_yield();
+}
+
 static uint64_t pe_mm_mprotect(uint64_t addr, uint64_t length, uint64_t flags) {
-    cap_t mm_ep = g_pe_rtld.mm_ep != 0 ? g_pe_rtld.mm_ep : CAP_MMSRV_EP;
+    cap_t mm_ep = g_pe_rtld.cap_mmsrv_ep;
     uint64_t prot = PROT_READ;
 
     if (mm_ep == 0 || g_pe_rtld.ipc_buffer_vaddr == 0)
@@ -276,8 +283,8 @@ static uint64_t resolve_single_import(cap_t win32srv_ep,
         return 0;
 
     size_t name_len = pe_strlen(func_name);
-    uint64_t regs[20];
-    for (size_t i = 0; i < 20; i++) {
+    uint64_t regs[32];
+    for (size_t i = 0; i < 32; i++) {
         regs[i] = 0;
     }
     if (name_len > 144)
@@ -292,7 +299,7 @@ static uint64_t resolve_single_import(cap_t win32srv_ep,
     uint64_t length = 2 + ((uint64_t)name_len + 7) / 8;
     if (length > 4 && g_pe_rtld.ipc_buffer_vaddr != 0) {
         uint64_t *ipc_msg = (uint64_t *)g_pe_rtld.ipc_buffer_vaddr;
-        for (uint64_t i = 0; i < length - 4 && i < 16; i++) {
+        for (uint64_t i = 0; i < length - 4 && i < 28; i++) {
             ipc_msg[6 + i] = regs[4 + i];
         }
     }
@@ -413,26 +420,136 @@ static uint64_t resolve_kernel32_export(const char *func_name, uint16_t ordinal)
     return lookup_export_by_ordinal(image_base, export_dir, ordinal);
 }
 
-static void initialize_kernel32_runtime(void) {
-    struct kernel32_ipc_context *ipc_ctx;
-    uint64_t *win32srv_ep;
+static int pe_is_valid_import_lookup_entry(uint64_t entry, uint64_t image_size) {
+    if (entry == 0)
+        return 1;
 
-    ipc_ctx = (struct kernel32_ipc_context *)resolve_kernel32_export("__trona_ipc_ctx", 0);
-    if (ipc_ctx != NULL) {
-        ipc_ctx->ipc_buffer = (void *)g_pe_rtld.ipc_buffer_vaddr;
-        ipc_ctx->send_cap_count = 0;
+    if (entry & ((uint64_t)1 << 63)) {
+        /* Import-by-ordinal: only the high bit and low 16-bit ordinal are valid. */
+        return (entry & 0x7FFFffffFFFF0000ULL) == 0;
     }
 
-    win32srv_ep = (uint64_t *)resolve_kernel32_export("__win32srv_ep", 0);
-    if (win32srv_ep != NULL)
-        *win32srv_ep = g_pe_rtld.win32srv_ep;
+    return entry + 2 <= image_size;
+}
+
+static uint64_t pe_normalize_import_lookup_entry(uint64_t entry,
+                                                 int64_t delta,
+                                                 uint64_t image_size,
+                                                 int ilt_aliases_iat) {
+    if (!ilt_aliases_iat || pe_is_valid_import_lookup_entry(entry, image_size))
+        return entry;
+
+    /* When OFT==0, some images reuse IAT as ILT. If the relocation table
+     * touched those entries, they now contain (raw_rva + delta). Undo the
+     * base-relocation bias before decoding the import name/ordinal. */
+    uint64_t recovered = entry - (uint64_t)delta;
+    if (pe_is_valid_import_lookup_entry(recovered, image_size))
+        return recovered;
+
+    return entry;
+}
+
+static void initialize_kernel32_runtime(void) {
+    typedef void (PE_KERNEL32_CALL *kernel32_runtime_init_fn)(
+        uint64_t ipc_buffer_vaddr,
+        uint64_t win32srv_ep,
+        uint64_t cap_procmgr_ep,
+        uint64_t cap_vfs_ep
+    );
+
+    kernel32_runtime_init_fn init_fn =
+        (kernel32_runtime_init_fn)(uintptr_t)resolve_kernel32_export("kernel32_runtime_init", 0);
+    if (init_fn == NULL) {
+        pe_rtld_puts("[PE-RTLD] FATAL: kernel32 runtime init export missing\n");
+        pe_exit(124);
+    }
+
+    init_fn(
+        g_pe_rtld.ipc_buffer_vaddr,
+        g_pe_rtld.win32srv_ep,
+        g_pe_rtld.cap_procmgr_ep,
+        g_pe_rtld.cap_vfs_ep
+    );
+}
+
+static int apply_pe_image_permissions(uint64_t image_base,
+                                      uint64_t image_size,
+                                      const char *image_name) {
+    const DosHeader *dos;
+    const CoffHeader *coff;
+    const OptionalHeader64 *opt;
+    const SectionHeader *sections;
+    uint16_t num_sections;
+
+    int err = pe_validate((const uint8_t *)(uintptr_t)image_base, image_size,
+                          &dos, &coff, &opt, &sections, &num_sections);
+    if (err != 0) {
+        pe_rtld_puts("[PE-RTLD] FATAL: ");
+        pe_rtld_puts(image_name);
+        pe_rtld_puts(" validation for mprotect failed err=");
+        pe_rtld_hex((uint64_t)(uint32_t)(-err));
+        pe_rtld_puts("\n");
+        return err;
+    }
+    (void)dos;
+    (void)coff;
+
+    uint64_t hdr_pages = pe_page_align_up(opt->size_of_headers) / PAGE_SIZE;
+    if (hdr_pages > 0) {
+        uint64_t ret = pe_mm_mprotect(image_base, hdr_pages * PAGE_SIZE, VSPACE_FLAG_USER);
+        if (ret != 0) {
+            pe_rtld_puts("[PE-RTLD] FATAL: ");
+            pe_rtld_puts(image_name);
+            pe_rtld_puts(" header mprotect failed ret=");
+            pe_rtld_hex(ret);
+            pe_rtld_puts("\n");
+            return -1;
+        }
+    }
+
+    for (uint16_t si = 0; si < num_sections; si++) {
+        uint64_t sec_base = image_base + sections[si].virtual_address;
+        uint32_t sec_sz = sections[si].virtual_size > 0
+            ? sections[si].virtual_size
+            : sections[si].size_of_raw_data;
+        uint64_t sec_pages = pe_page_align_up(sec_sz) / PAGE_SIZE;
+        if (sec_pages == 0)
+            continue;
+
+        uint64_t flags = pe_section_to_vspace_flags(sections[si].characteristics);
+        uint64_t ret = pe_mm_mprotect(sec_base, sec_pages * PAGE_SIZE, flags);
+        pe_rtld_puts("[PE-RTLD] protect ");
+        pe_rtld_puts(image_name);
+        pe_rtld_puts(" ");
+        pe_rtld_hex(sec_base);
+        pe_rtld_puts(" pages=");
+        pe_rtld_hex(sec_pages);
+        pe_rtld_puts(" flags=");
+        pe_rtld_hex(flags);
+        pe_rtld_puts(" ret=");
+        pe_rtld_hex(ret);
+        pe_rtld_puts("\n");
+        if (ret != 0) {
+            pe_rtld_puts("[PE-RTLD] FATAL: ");
+            pe_rtld_puts(image_name);
+            pe_rtld_puts(" section mprotect failed\n");
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 static int resolve_imports(uint8_t *image_base, uint64_t image_size,
                            const OptionalHeader64 *opt,
                            const SectionHeader *sections,
                            uint16_t num_sections,
-                           cap_t win32srv_ep, uint64_t scratch) {
+                           cap_t win32srv_ep, uint64_t scratch,
+                           int64_t delta) {
+    (void)sections;
+    (void)num_sections;
+    (void)scratch;
+
     if (opt->number_of_rva_and_sizes <= IMAGE_DIRECTORY_ENTRY_IMPORT)
         return 0;
 
@@ -465,17 +582,24 @@ static int resolve_imports(uint8_t *image_base, uint64_t image_size,
          * contains fixups for IAT entries). */
         uint32_t ilt_rva = desc->original_first_thunk;
         uint32_t iat_rva = desc->first_thunk;
+        int ilt_aliases_iat = 0;
 
-        if (ilt_rva == 0)
+        if (ilt_rva == 0) {
             ilt_rva = iat_rva;
+            ilt_aliases_iat = 1;
+        }
         if (iat_rva == 0)
             continue;
 
         const uint64_t *ilt = (const uint64_t *)(image_base + ilt_rva);
         uint64_t *iat = (uint64_t *)(image_base + iat_rva);
 
-        for (int idx = 0; ilt[idx] != 0; idx++) {
-            uint64_t entry = ilt[idx];
+        for (int idx = 0;; idx++) {
+            uint64_t entry = pe_normalize_import_lookup_entry(
+                ilt[idx], delta, image_size, ilt_aliases_iat
+            );
+            if (entry == 0)
+                break;
             const char *func_name = NULL;
             uint16_t ordinal = 0;
 
@@ -600,20 +724,14 @@ void __attribute__((noreturn)) pe_rtld_main(uint64_t *sp) {
         case AT_TRONA_VSPACE:
             g_pe_rtld.vspace = p[1];
             break;
-        case AT_TRONA_MM_EP:
-            g_pe_rtld.mm_ep = p[1];
-            break;
         case AT_TRONA_SCRATCH:
             g_pe_rtld.scratch_vaddr = p[1];
             break;
         case AT_TRONA_IPC_BUFFER:
             g_pe_rtld.ipc_buffer_vaddr = p[1];
             break;
-        case AT_TRONA_SLOT_BASE:
-            g_pe_rtld.slot_base = p[1];
-            break;
-        case AT_TRONA_SLOT_COUNT:
-            g_pe_rtld.slot_count = p[1];
+        case AT_TRONA_CSPACE_LAYOUT:
+            g_pe_rtld.cspace_layout = (struct trona_cspace_layout_v1 *)(uintptr_t)p[1];
             break;
         case AT_TRONA_CSPACE_NTFN:
             g_pe_rtld.cspace_ntfn = p[1];
@@ -621,6 +739,36 @@ void __attribute__((noreturn)) pe_rtld_main(uint64_t *sp) {
         case AT_TRONA_SC_CAP:
             g_pe_rtld.sc_cap = p[1];
             break;
+        case AT_TRONA_CAP_TABLE:
+            g_pe_rtld.cap_table = (struct trona_cap_table_v1 *)(uintptr_t)p[1];
+            break;
+        }
+    }
+
+    /* 1b. Walk the startup cap_table. PE rtld only caches the three
+     * cap slots it uses itself (procmgr for pe_exit + kernel32 shim,
+     * mmsrv for PE image mapping, vfs for kernel32 shim); everything
+     * else that a PE binary might observe goes through libtrona's
+     * `__trona_cap_*` weak symbols via the substrate install path at
+     * startup. kernel32.dll itself is primed later through the single
+     * `kernel32_runtime_init` entry point.
+     *
+     * CSPACE_NTFN and SC_CAP arrive through the preserved structural
+     * auxv tags (AT_TRONA_CSPACE_NTFN / AT_TRONA_SC_CAP) and do not
+     * need a cap_table fast-path here. */
+    if (g_pe_rtld.cap_table != NULL
+        && g_pe_rtld.cap_table->magic == TRONA_CAP_TABLE_MAGIC
+        && g_pe_rtld.cap_table->version == TRONA_CAP_TABLE_VERSION) {
+        const struct trona_cap_entry_v1 *entries =
+            (const struct trona_cap_entry_v1 *)(g_pe_rtld.cap_table + 1);
+        for (uint32_t i = 0; i < g_pe_rtld.cap_table->count; i++) {
+            const struct trona_cap_entry_v1 *e = &entries[i];
+            switch (e->role_id) {
+            case ROLE_PROCMGR_CONTROL: g_pe_rtld.cap_procmgr_ep = e->slot; break;
+            case ROLE_MMSRV_CLIENT:    g_pe_rtld.cap_mmsrv_ep   = e->slot; break;
+            case ROLE_VFS_CLIENT:      g_pe_rtld.cap_vfs_ep     = e->slot; break;
+            default: break;
+            }
         }
     }
 
@@ -690,6 +838,12 @@ void __attribute__((noreturn)) pe_rtld_main(uint64_t *sp) {
         pe_exit(124);
     }
 
+    if (apply_pe_image_permissions(g_pe_rtld.kernel32_base,
+                                   g_pe_rtld.kernel32_size,
+                                   "kernel32.dll") != 0) {
+        pe_exit(123);
+    }
+
     initialize_kernel32_runtime();
 
     /* 5. Resolve imports */
@@ -699,94 +853,20 @@ void __attribute__((noreturn)) pe_rtld_main(uint64_t *sp) {
 
     err = resolve_imports(image, image_size, opt, sections, num_sections,
                           (cap_t)g_pe_rtld.win32srv_ep,
-                          g_pe_rtld.scratch_vaddr);
+                          g_pe_rtld.scratch_vaddr,
+                          delta);
     if (err != 0) {
         pe_rtld_puts("[PE-RTLD] FATAL: import resolution failed\n");
         pe_exit(124);
     }
 
-    /* 6. Apply section permissions (W^X) now that IAT writes are done.
-     * Use MM_MPROTECT so mmsrv updates both region metadata and any
-     * currently-present PTEs for the mapped image.
+    /* 6. Apply section permissions after IAT writes are done so mmsrv updates
+     * both region metadata and any currently-present PTEs for the mapped image.
      */
-    {
-        uint64_t pe_base = g_pe_rtld.pe_base;
-
-        /* Headers: read-only */
-        uint64_t hdr_pages = pe_page_align_up(opt->size_of_headers) / PAGE_SIZE;
-        if (hdr_pages > 0) {
-            uint64_t ret = pe_mm_mprotect(pe_base, hdr_pages * PAGE_SIZE, VSPACE_FLAG_USER);
-            if (ret != 0) {
-                pe_rtld_puts("[PE-RTLD] FATAL: header mprotect failed ret=");
-                pe_rtld_hex(ret);
-                pe_rtld_puts("\n");
-                pe_exit(123);
-            }
-        }
-
-        /* Per-section permissions */
-        for (uint16_t si = 0; si < num_sections; si++) {
-            uint64_t sec_base = pe_base + sections[si].virtual_address;
-            uint32_t sec_sz = sections[si].virtual_size > 0
-                ? sections[si].virtual_size
-                : sections[si].size_of_raw_data;
-            uint64_t sec_pages = pe_page_align_up(sec_sz) / PAGE_SIZE;
-            if (sec_pages == 0)
-                continue;
-
-            uint64_t flags = pe_section_to_vspace_flags(sections[si].characteristics);
-            uint64_t ret = pe_mm_mprotect(sec_base, sec_pages * PAGE_SIZE, flags);
-            pe_rtld_puts("[PE-RTLD] protect ");
-            pe_rtld_hex(sec_base);
-            pe_rtld_puts(" pages=");
-            pe_rtld_hex(sec_pages);
-            pe_rtld_puts(" flags=");
-            pe_rtld_hex(flags);
-            pe_rtld_puts(" ret=");
-            pe_rtld_hex(ret);
-            pe_rtld_puts("\n");
-            if (ret != 0) {
-                pe_rtld_puts("[PE-RTLD] FATAL: section mprotect failed\n");
-                pe_exit(123);
-            }
-        }
-    }
-
-    /* 6b. Apply section permissions for kernel32.dll using the same path. */
-    if (g_pe_rtld.kernel32_base != 0 && g_pe_rtld.kernel32_size != 0) {
-        const DosHeader *k32_dos;
-        const CoffHeader *k32_coff;
-        const OptionalHeader64 *k32_opt;
-        const SectionHeader *k32_sections;
-        uint16_t k32_num_sections;
-        uint8_t *k32_base = (uint8_t *)g_pe_rtld.kernel32_base;
-
-        int k32_err = pe_validate(k32_base, g_pe_rtld.kernel32_size,
-                                  &k32_dos, &k32_coff, &k32_opt,
-                                  &k32_sections, &k32_num_sections);
-        if (k32_err == 0) {
-            /* Headers: read-only */
-            uint64_t k32_hdr_pages =
-                pe_page_align_up(k32_opt->size_of_headers) / PAGE_SIZE;
-            if (k32_hdr_pages > 0)
-                pe_mm_mprotect(g_pe_rtld.kernel32_base,
-                               k32_hdr_pages * PAGE_SIZE, VSPACE_FLAG_USER);
-
-            for (uint16_t si = 0; si < k32_num_sections; si++) {
-                uint64_t sec_base =
-                    g_pe_rtld.kernel32_base + k32_sections[si].virtual_address;
-                uint32_t sec_sz = k32_sections[si].virtual_size > 0
-                    ? k32_sections[si].virtual_size
-                    : k32_sections[si].size_of_raw_data;
-                uint64_t sec_pages = pe_page_align_up(sec_sz) / PAGE_SIZE;
-                if (sec_pages == 0)
-                    continue;
-
-                uint64_t flags =
-                    pe_section_to_vspace_flags(k32_sections[si].characteristics);
-                pe_mm_mprotect(sec_base, sec_pages * PAGE_SIZE, flags);
-            }
-        }
+    if (apply_pe_image_permissions(g_pe_rtld.pe_base,
+                                   image_size,
+                                   "main PE") != 0) {
+        pe_exit(123);
     }
 
     /* 7. Jump to PE entry point */

@@ -10,10 +10,15 @@
 
 struct rtld_state g_rtld;
 
-static struct link_map *find_loaded_object(struct rtld_state *st, const char *name) {
+struct link_map *find_loaded_object(struct rtld_state *st, const char *name) {
+    char canonical_name[RTLD_MAX_OBJECT_NAME];
+
+    if (!rtld_make_canonical_object_name(name, canonical_name, sizeof(canonical_name)))
+        return NULL;
+
     struct link_map *cur = st->head;
     while (cur) {
-        if (cur->name && rtld_strcmp(cur->name, name) == 0)
+        if (cur->name && rtld_strcmp(cur->name, canonical_name) == 0)
             return cur;
         cur = cur->next;
     }
@@ -35,6 +40,16 @@ static uint64_t resolve_symbol_addr_in_object(
     return linear_lookup(map, symbol_name);
 }
 
+static void install_cap_table_via_libtrona(struct rtld_state *st, const uint64_t *auxv) {
+    typedef void (*trona_runtime_set_auxv_fn)(const uint64_t *auxv);
+    const char *libtrona_name = RTLD_INITRD_LIB_PREFIX "libtrona.so";
+
+    uint64_t addr = resolve_symbol_addr_in_object(st, libtrona_name, "trona_runtime_set_auxv");
+    if (addr != 0) {
+        ((trona_runtime_set_auxv_fn)addr)(auxv);
+    }
+}
+
 /* Exported pointer to g_rtld for libc dladdr()/dl_iterate_phdr().
  * libc declares this as `extern` and uses it to walk the link_map chain. */
 __attribute__((visibility("default")))
@@ -43,11 +58,11 @@ struct rtld_state *__rtld_global = &g_rtld;
 /* Exported so applications can continue allocating frame slots after rtld */
 uint64_t __trona_next_frame_slot = 0;
 
-/* Exported per-process slot pool info for slot_alloc */
-uint64_t __trona_slot_base = 0;
-uint64_t __trona_slot_count = 0;
 uint64_t __trona_cspace_ntfn = 0;
 uint64_t __trona_sc_cap = 0;
+
+/* rtld keeps no local `__trona_cap_*` mirrors — the startup cap_table
+ * walker below writes directly into libtrona.so's weak symbols. */
 
 /* Exported ELF TLS info so libtrona can set up the TLS data area */
 uint64_t __trona_tls_template = 0;  /* Runtime address of .tdata template */
@@ -81,23 +96,28 @@ void __attribute__((naked, noreturn)) _start(void) {
 static void self_relocate(uint64_t base, Elf64_Dyn *dyn) {
     Elf64_Rela *rela = NULL;
     uint64_t rela_size = 0;
+    uint64_t rela_ent_size = sizeof(Elf64_Rela);
 
     for (int i = 0; dyn[i].d_tag != DT_NULL; i++) {
         if (dyn[i].d_tag == DT_RELA)
             rela = (Elf64_Rela *)(base + dyn[i].d_val);
         else if (dyn[i].d_tag == DT_RELASZ)
             rela_size = dyn[i].d_val;
+        else if (dyn[i].d_tag == DT_RELAENT && dyn[i].d_val >= sizeof(Elf64_Rela))
+            rela_ent_size = dyn[i].d_val;
     }
 
-    if (!rela || rela_size == 0)
+    if (!rela || rela_size == 0 || rela_ent_size < sizeof(Elf64_Rela))
         return;
 
-    uint64_t count = rela_size / sizeof(Elf64_Rela);
+    uint64_t count = rela_size / rela_ent_size;
     for (uint64_t i = 0; i < count; i++) {
-        uint32_t type = ELF64_R_TYPE(rela[i].r_info);
+        Elf64_Rela entry;
+        rtld_memcpy(&entry, (const uint8_t *)rela + rela_ent_size * i, sizeof(entry));
+        uint32_t type = ELF64_R_TYPE(entry.r_info);
         if (type == R_RELATIVE) {
-            uint64_t *target = (uint64_t *)(base + rela[i].r_offset);
-            *target = base + (uint64_t)rela[i].r_addend;
+            uint64_t *target = (uint64_t *)(base + entry.r_offset);
+            *target = base + (uint64_t)entry.r_addend;
         }
     }
 }
@@ -162,7 +182,8 @@ static void finalize_static_tls_layout(struct rtld_state *st) {
 }
 
 static void export_static_tls_layout(struct rtld_state *st) {
-    const char *libtrona_name = "libtrona.so";
+    const char *libtrona_name = RTLD_INITRD_LIB_PREFIX "libtrona.so";
+    const char *libc_name = RTLD_INITRD_LIB_PREFIX "libc.so";
 
     __trona_tls_template = st->exe_tls_vaddr;
     __trona_tls_filesz = st->exe_tls_filesz;
@@ -216,6 +237,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     /* Skip past envp (entries until NULL) */
     while (*p != 0) p++;
     p++;  /* skip the NULL terminator */
+    const uint64_t *auxv = p;
 
     /* Now p points to auxv array (key/value pairs, terminated by AT_NULL) */
     uint64_t at_phdr = 0;
@@ -234,15 +256,26 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         case AT_TRONA_UNTYPED:   g_rtld.untyped = p[1]; break;
         case AT_TRONA_VSPACE:    g_rtld.vspace = p[1]; break;
         case AT_TRONA_SCRATCH:   g_rtld.scratch_vaddr = p[1]; break;
+        case AT_TRONA_IPC_BUFFER:g_rtld.ipc_buffer_vaddr = p[1]; break;
         case AT_TRONA_INITRD:    g_rtld.initrd_base = p[1]; break;
         case AT_TRONA_INITRD_SZ: g_rtld.initrd_size = p[1]; break;
-        case AT_TRONA_FRAME_SLOT:g_rtld.next_frame_slot = p[1]; break;
+        case AT_TRONA_CSPACE_LAYOUT:
+            g_rtld.cspace_layout = (struct trona_cspace_layout_v1 *)(uintptr_t)p[1];
+            if (g_rtld.cspace_layout && g_rtld.cspace_layout->version == 1)
+                g_rtld.next_frame_slot = g_rtld.cspace_layout->frame_slot_base;
+            break;
         case AT_TRONA_SHARED_LIB_BASE: g_rtld.shared_lib_base = p[1]; break;
-        case AT_TRONA_SLOT_BASE:  g_rtld.slot_base = p[1]; break;
-        case AT_TRONA_SLOT_COUNT: g_rtld.slot_count = p[1]; break;
         case AT_TRONA_CSPACE_NTFN: g_rtld.cspace_ntfn = p[1]; break;
         case AT_TRONA_SC_CAP:  g_rtld.sc_cap = p[1]; break;
+        case AT_TRONA_CAP_TABLE:
+            g_rtld.cap_table = (struct trona_cap_table_v1 *)(uintptr_t)p[1];
+            break;
         }
+    }
+
+    if (!g_rtld.cspace_layout || g_rtld.cspace_layout->version != 1) {
+        rtld_puts("[RTLD] FATAL: missing AT_TRONA_CSPACE_LAYOUT\n");
+        rtld_exit(127);
     }
 
     /* 2. Self-relocate.
@@ -298,13 +331,15 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         }
     }
 
-    /* Compute load delta: AT_PHDR is the actual runtime address of the phdrs,
-     * while exe_phdr_vaddr is the file-level vaddr from the PT_PHDR entry.
-     * The difference is the slide applied by the loader.
+    /* Compute the executable load bias: AT_PHDR is the actual runtime address
+     * of the phdrs, while exe_phdr_vaddr is the ELF virtual address from the
+     * PT_PHDR entry. Dynamic tags, relocation offsets, and symbol values are
+     * all expressed in that ELF virtual-address space, so the runtime linker
+     * must add the load bias rather than the mapped image start address.
      */
-    uint64_t exe_load_delta = 0;
+    uint64_t exe_load_bias = 0;
     if (have_phdr) {
-        exe_load_delta = at_phdr - exe_phdr_vaddr;
+        exe_load_bias = at_phdr - exe_phdr_vaddr;
     } else if (at_phdr >= sizeof(Elf64_Ehdr)) {
         /* Fallback: if no PT_PHDR, try reading the ELF header which is
          * expected immediately before the phdrs (e_phoff == sizeof(Elf64_Ehdr)
@@ -313,22 +348,22 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         Elf64_Ehdr *exe_ehdr = (Elf64_Ehdr *)(at_phdr - sizeof(Elf64_Ehdr));
         if (exe_ehdr->e_ident[0] == 0x7F && exe_ehdr->e_ident[1] == 'E' &&
             exe_ehdr->e_ident[2] == 'L'  && exe_ehdr->e_ident[3] == 'F') {
-            exe_load_delta = at_phdr - exe_ehdr->e_phoff;
+            exe_load_bias = at_phdr - exe_ehdr->e_phoff;
             rtld_dbg_puts("[RTLD] PT_PHDR missing, computed delta from ELF header\n");
         } else {
             rtld_puts("[RTLD] WARN: no PT_PHDR and ELF header not found\n");
         }
     }
 
-    /* Apply delta to exe_dyn (which was set from the file-level vaddr) */
+    /* Apply the load bias to PT_DYNAMIC (which was captured as an ELF vaddr). */
     if (exe_dyn)
-        exe_dyn = (Elf64_Dyn *)((uint64_t)exe_dyn + exe_load_delta);
-    exe_base = exe_min_vaddr + exe_load_delta;
+        exe_dyn = (Elf64_Dyn *)((uint64_t)exe_dyn + exe_load_bias);
+    exe_base = exe_load_bias;
     g_rtld.exe_phdr = at_phdr;
 
     /* Apply delta to TLS template address */
     if (g_rtld.exe_tls_memsz > 0)
-        g_rtld.exe_tls_vaddr += exe_load_delta;
+        g_rtld.exe_tls_vaddr += exe_load_bias;
 
     /* Create link_map for executable */
     struct link_map *exe_map = &g_rtld.objects[0];
@@ -338,6 +373,7 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
 
     if (exe_dyn) {
         parse_dynamic(exe_map, exe_dyn, exe_base);
+        exe_map->dyn_section = exe_dyn;
     }
     exe_map->tls_template = g_rtld.exe_tls_vaddr;
     exe_map->tls_filesz = g_rtld.exe_tls_filesz;
@@ -417,6 +453,43 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         }
     }
 
+    /* 4b. BFS: process transitive DT_NEEDED from loaded libraries.
+     * Walk objects[1..] (libraries); newly loaded objects are appended
+     * to the array and will be visited in subsequent iterations.
+     */
+    {
+        int processed = 1;
+        while (processed < g_rtld.nobjects) {
+            struct link_map *map = &g_rtld.objects[processed];
+            if (map->dyn_section && map->strtab) {
+                for (int di = 0; map->dyn_section[di].d_tag != DT_NULL; di++) {
+                    if (map->dyn_section[di].d_tag != DT_NEEDED)
+                        continue;
+                    const char *dep_name = map->strtab + map->dyn_section[di].d_val;
+                    if (find_loaded_object(&g_rtld, dep_name))
+                        continue;
+                    int err = load_shared_library(&g_rtld, dep_name, lib_load_addr);
+                    if (err != 0) {
+                        struct rtld_linebuf lb;
+                        rtld_lb_init(&lb);
+                        rtld_lb_str(&lb, "[RTLD] FATAL: transitive dep ");
+                        rtld_lb_str(&lb, dep_name);
+                        rtld_lb_str(&lb, " err=");
+                        rtld_lb_hex(&lb, (uint64_t)err);
+                        rtld_lb_str(&lb, "\n");
+                        rtld_lb_flush(&lb);
+                        rtld_exit(127);
+                    }
+                    struct link_map *dep_map = &g_rtld.objects[g_rtld.nobjects - 1];
+                    uint64_t advance = dep_map->load_size;
+                    if (advance == 0) advance = 0x80000ULL;
+                    lib_load_addr += advance + PAGE_SIZE;
+                }
+            }
+            processed++;
+        }
+    }
+
     finalize_static_tls_layout(&g_rtld);
 
     /* 5. Process relocations for all loaded objects (libs first, then exe) */
@@ -447,7 +520,8 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
     /* 7. Export frame slot so user code can allocate after rtld.
      * __trona_next_frame_slot references in user code resolve to libtrona,
      * so update that symbol explicitly if present. */
-    const char *libtrona_name = "libtrona.so";
+    const char *libtrona_name = RTLD_INITRD_LIB_PREFIX "libtrona.so";
+    const char *libc_name = RTLD_INITRD_LIB_PREFIX "libc.so";
 
     __trona_next_frame_slot = g_rtld.next_frame_slot;
     {
@@ -456,34 +530,13 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
             *(volatile uint64_t *)slot_addr = g_rtld.next_frame_slot;
     }
 
-    /* 7b. Export per-process slot pool info for slot_alloc.
-     * Advance base/count past the slots already consumed by RTLD itself
-     * (ld.so + DT_NEEDED library allocations), so user allocators start
-     * from the first truly free slot.
-     */
-    uint64_t export_slot_base = g_rtld.slot_base;
-    uint64_t export_slot_count = g_rtld.slot_count;
-    if (export_slot_base != 0 && export_slot_count != 0 &&
-        g_rtld.next_frame_slot >= export_slot_base) {
-        uint64_t used = g_rtld.next_frame_slot - export_slot_base;
-        if (used < export_slot_count) {
-            export_slot_base = g_rtld.next_frame_slot;
-            export_slot_count -= used;
-        } else {
-            export_slot_base = g_rtld.next_frame_slot;
-            export_slot_count = 0;
-        }
-    }
-
-    __trona_slot_base = export_slot_base;
-    __trona_slot_count = export_slot_count;
-    {
-        uint64_t base_addr = resolve_symbol_addr_in_object(&g_rtld, libtrona_name, "__trona_slot_base");
-        if (base_addr != 0)
-            *(volatile uint64_t *)base_addr = export_slot_base;
-        uint64_t count_addr = resolve_symbol_addr_in_object(&g_rtld, libtrona_name, "__trona_slot_count");
-        if (count_addr != 0)
-            *(volatile uint64_t *)count_addr = export_slot_count;
+    /* 7b. Advance the shared CSpace layout descriptor past the frame slots
+     * consumed by RTLD itself so later runtime code sees the post-RTLD truth. */
+    if (g_rtld.next_frame_slot > g_rtld.cspace_layout->alloc_base) {
+        if (g_rtld.next_frame_slot < g_rtld.cspace_layout->alloc_limit)
+            g_rtld.cspace_layout->alloc_base = g_rtld.next_frame_slot;
+        else
+            g_rtld.cspace_layout->alloc_base = g_rtld.cspace_layout->alloc_limit;
     }
 
     /* 7c. Export CSpace expansion notification cap for slot_alloc. */
@@ -500,6 +553,40 @@ void __attribute__((noreturn)) rtld_main(uint64_t *sp) {
         uint64_t sc_addr = resolve_symbol_addr_in_object(&g_rtld, libtrona_name, "__trona_sc_cap");
         if (sc_addr != 0)
             *(volatile uint64_t *)sc_addr = g_rtld.sc_cap;
+    }
+
+    /* 7c3. Delegate startup cap-table installation to libtrona's shared
+     * substrate helper. That helper saves the auxv pointer and performs
+     * the single authoritative role->`__trona_cap_*` install sweep,
+     * including any generated `svc_caps` hook.
+     *
+     * rtld still caches the two slots it uses directly:
+     *   ROLE_PROCMGR_CONTROL  -> g_rtld.cap_procmgr_ep
+     *   ROLE_INITRD_UNTYPED   -> g_rtld.cap_initrd_untyped
+     */
+    install_cap_table_via_libtrona(&g_rtld, auxv);
+    if (g_rtld.cap_table != NULL
+        && g_rtld.cap_table->magic == TRONA_CAP_TABLE_MAGIC
+        && g_rtld.cap_table->version == TRONA_CAP_TABLE_VERSION) {
+        const struct trona_cap_entry_v1 *entries =
+            (const struct trona_cap_entry_v1 *)(g_rtld.cap_table + 1);
+        for (uint32_t i = 0; i < g_rtld.cap_table->count; i++) {
+            const struct trona_cap_entry_v1 *e = &entries[i];
+            switch (e->role_id) {
+            case ROLE_PROCMGR_CONTROL: g_rtld.cap_procmgr_ep = e->slot;    break;
+            case ROLE_INITRD_UNTYPED:  g_rtld.cap_initrd_untyped = e->slot; break;
+            default: break;
+            }
+        }
+    }
+
+    /* 7c3. Export rtld state pointer into libc's local __rtld_global slot.
+     * libc's dlopen/dladdr helpers use this to walk the startup link-map chain,
+     * but the interpreter symbol is not wired into DSOs automatically here. */
+    {
+        uint64_t rtld_global_addr = resolve_symbol_addr_in_object(&g_rtld, libc_name, "__rtld_global");
+        if (rtld_global_addr != 0)
+            *(volatile uint64_t *)rtld_global_addr = (uint64_t)&g_rtld;
     }
 
     /* 7d. Export combined static TLS layout for libtrona. */

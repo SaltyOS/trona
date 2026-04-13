@@ -17,9 +17,11 @@ void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
     map->gnu_hash = NULL;
     map->jmprel = NULL;
     map->jmprel_count = 0;
+    map->jmprel_ent_size = sizeof(Elf64_Rela);
     map->pltgot = NULL;
     map->rela = NULL;
     map->rela_count = 0;
+    map->rela_ent_size = sizeof(Elf64_Rela);
     map->tls_template = 0;
     map->tls_filesz = 0;
     map->tls_memsz = 0;
@@ -29,6 +31,11 @@ void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
     map->init_fn = NULL;
     map->init_array = NULL;
     map->init_array_count = 0;
+    map->dyn_section = NULL;
+
+    uint64_t rela_size = 0;
+    uint64_t jmprel_size = 0;
+    uint64_t pltrel_type = DT_RELA;
 
     for (int i = 0; dyn[i].d_tag != DT_NULL; i++) {
         switch (dyn[i].d_tag) {
@@ -52,7 +59,10 @@ void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
             map->jmprel = (Elf64_Rela *)(base + dyn[i].d_val);
             break;
         case DT_PLTRELSZ:
-            map->jmprel_count = dyn[i].d_val / sizeof(Elf64_Rela);
+            jmprel_size = dyn[i].d_val;
+            break;
+        case DT_PLTREL:
+            pltrel_type = dyn[i].d_val;
             break;
         case DT_PLTGOT:
             map->pltgot = (uint64_t *)(base + dyn[i].d_val);
@@ -61,7 +71,13 @@ void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
             map->rela = (Elf64_Rela *)(base + dyn[i].d_val);
             break;
         case DT_RELASZ:
-            map->rela_count = dyn[i].d_val / sizeof(Elf64_Rela);
+            rela_size = dyn[i].d_val;
+            break;
+        case DT_RELAENT:
+            if (dyn[i].d_val >= sizeof(Elf64_Rela)) {
+                map->rela_ent_size = dyn[i].d_val;
+                map->jmprel_ent_size = dyn[i].d_val;
+            }
             break;
         case DT_INIT:
             map->init_fn = (void (*)(void))(base + dyn[i].d_val);
@@ -73,6 +89,16 @@ void parse_dynamic(struct link_map *map, Elf64_Dyn *dyn, uint64_t base) {
             map->init_array_count = dyn[i].d_val / sizeof(void (*)(void));
             break;
         }
+    }
+
+    if (map->rela && map->rela_ent_size >= sizeof(Elf64_Rela)) {
+        map->rela_count = rela_size / map->rela_ent_size;
+    }
+    if (pltrel_type == DT_RELA && map->jmprel && map->jmprel_ent_size >= sizeof(Elf64_Rela)) {
+        map->jmprel_count = jmprel_size / map->jmprel_ent_size;
+    } else {
+        map->jmprel = NULL;
+        map->jmprel_count = 0;
     }
 
     /* Derive an upper bound for dynsym entries when symtab precedes strtab.
@@ -201,20 +227,133 @@ static int patch_mapped_page(struct rtld_state *st, cap_t frame_slot,
     return 0;
 }
 
-int load_shared_library(struct rtld_state *st, const char *name,
-                         uint64_t load_addr) {
+/* Load a library that procmgr has already mapped into our VSpace.
+ * The ELF image is accessible at load_addr; we just parse metadata and
+ * create the link_map entry — no page allocation or mapping needed.
+ */
+static int load_premapped_library(struct rtld_state *st, const char *name,
+                                   uint64_t load_addr) {
+    char object_name[RTLD_MAX_OBJECT_NAME];
+
     if (st->nobjects >= RTLD_MAX_OBJECTS) {
         rtld_puts("[RTLD] too many loaded objects\n");
         return -1;
+    }
+    if (!rtld_make_canonical_object_name(name, object_name, sizeof(object_name))) {
+        rtld_puts("[RTLD] object name too long\n");
+        return -2;
+    }
+
+    /* The ELF header should be at the start of the mapped region */
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)load_addr;
+    if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
+        ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F')
+        return -3;
+    if (ehdr->e_type != ET_DYN)
+        return -4;
+
+    Elf64_Phdr *phdrs = (Elf64_Phdr *)(load_addr + ehdr->e_phoff);
+
+    /* Find min vaddr to compute load delta */
+    uint64_t min_vaddr = UINT64_MAX;
+    uint64_t tls_template = 0, tls_filesz = 0, tls_memsz = 0, tls_align = 1;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_vaddr < min_vaddr)
+            min_vaddr = phdrs[i].p_vaddr;
+        if (phdrs[i].p_type == PT_TLS) {
+            tls_template = phdrs[i].p_vaddr;
+            tls_filesz = phdrs[i].p_filesz;
+            tls_memsz = phdrs[i].p_memsz;
+            tls_align = phdrs[i].p_align ? phdrs[i].p_align : 1;
+        }
+    }
+
+    uint64_t base = load_addr;
+    uint64_t delta = base - (min_vaddr & ~(uint64_t)(PAGE_SIZE - 1));
+
+    /* Compute load footprint */
+    uint64_t max_end = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrs[i].p_type != PT_LOAD) continue;
+        uint64_t seg_end = rtld_page_align_up(phdrs[i].p_vaddr + delta + phdrs[i].p_memsz);
+        if (seg_end > max_end) max_end = seg_end;
+    }
+
+    /* Find PT_DYNAMIC */
+    Elf64_Dyn *lib_dyn = NULL;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrs[i].p_type == PT_DYNAMIC) {
+            lib_dyn = (Elf64_Dyn *)(phdrs[i].p_vaddr + delta);
+            break;
+        }
+    }
+
+    /* Create link_map entry */
+    struct link_map *map = &st->objects[st->nobjects];
+    if (!rtld_set_object_name(map, object_name)) {
+        rtld_puts("[RTLD] object name too long\n");
+        return -6;
+    }
+    map->next = NULL;
+    map->load_size = (max_end > load_addr) ? (max_end - load_addr) : 0;
+
+    if (lib_dyn) {
+        parse_dynamic(map, lib_dyn, base);
+        map->dyn_section = lib_dyn;
+    } else {
+        map->base = base;
+    }
+    if (tls_memsz != 0) {
+        map->tls_template = tls_template + delta;
+        map->tls_filesz = tls_filesz;
+        map->tls_memsz = tls_memsz;
+        map->tls_align = tls_align;
+    }
+
+    /* Append to linked list */
+    struct link_map *tail = st->head;
+    while (tail->next)
+        tail = tail->next;
+    tail->next = map;
+
+    st->nobjects++;
+
+    { struct rtld_linebuf lb; rtld_lb_init(&lb);
+      rtld_lb_str(&lb, "[RTLD] loaded pre-mapped: ");
+      rtld_lb_str(&lb, map->name);
+      rtld_lb_str(&lb, " base=");
+      rtld_lb_hex(&lb, base);
+      rtld_lb_str(&lb, "\n");
+      rtld_lb_flush(&lb); }
+
+    return 0;
+}
+
+int load_shared_library(struct rtld_state *st, const char *name,
+                         uint64_t load_addr) {
+    char object_name[RTLD_MAX_OBJECT_NAME];
+
+    if (st->nobjects >= RTLD_MAX_OBJECTS) {
+        rtld_puts("[RTLD] too many loaded objects\n");
+        return -1;
+    }
+    if (!rtld_make_canonical_object_name(name, object_name, sizeof(object_name))) {
+        rtld_puts("[RTLD] object name too long\n");
+        return -2;
     }
 
     /* Find the .so in the CPIO initrd */
     struct rtld_cpio_entry cpio;
     if (!rtld_cpio_find((const uint8_t *)st->initrd_base, st->initrd_size,
-                         name, &cpio)) {
+                         object_name, &cpio)) {
+        /* CPIO miss — check if procmgr pre-mapped this library at the
+         * expected address (VFS-loaded libraries). */
+        if (st->shared_lib_base != 0 && load_addr >= st->shared_lib_base) {
+            return load_premapped_library(st, object_name, load_addr);
+        }
         { struct rtld_linebuf lb; rtld_lb_init(&lb);
-          rtld_lb_str(&lb, "[RTLD] not found in initrd: ");
-          rtld_lb_str(&lb, name); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
+          rtld_lb_str(&lb, "[RTLD] not found: ");
+          rtld_lb_str(&lb, object_name); rtld_lb_str(&lb, "\n"); rtld_lb_flush(&lb); }
         return -2;
     }
 
@@ -255,7 +394,7 @@ int load_shared_library(struct rtld_state *st, const char *name,
     struct rtld_lib_page pages[RTLD_MAX_LIB_PAGES];
     size_t page_count = 0;
 
-    /* Check if this library was pre-mapped by procmgr */
+    /* Check if this library was pre-mapped by init/procmgr */
     int is_premapped = (st->shared_lib_base != 0
                         && load_addr >= st->shared_lib_base);
 
@@ -270,7 +409,7 @@ int load_shared_library(struct rtld_state *st, const char *name,
         uint64_t seg_end = rtld_page_align_up(seg_vaddr + ph->p_memsz);
         uint64_t flags = rtld_elf_to_vspace_flags(ph->p_flags);
 
-        /* Segment already mapped by procmgr — no per-page tracking needed */
+        /* Segment already mapped by parent — skip page allocation */
         if (is_premapped) {
             continue;
         }
@@ -363,7 +502,7 @@ int load_shared_library(struct rtld_state *st, const char *name,
                     uint64_t src_off = (uint64_t)((uintptr_t)src_page - (uintptr_t)st->initrd_base);
                     if (src_off + PAGE_SIZE <= st->initrd_size) {
                         uint64_t derr = rtld_vspace_map_device(
-                            st->vspace, CAP_INITRD_UNTYPED, src_off, page, flags);
+                            st->vspace, st->cap_initrd_untyped, src_off, page, flags);
                         if (derr == 0) {
                             pages[page_count].vaddr = page;
                             pages[page_count].frame_slot = 0;
@@ -411,14 +550,19 @@ int load_shared_library(struct rtld_state *st, const char *name,
     }
 
     struct link_map *map = &st->objects[st->nobjects];
-    map->name = name;
+    if (!rtld_set_object_name(map, object_name)) {
+        rtld_puts("[RTLD] object name too long\n");
+        return -6;
+    }
     map->next = NULL;
     map->load_size = (max_end > load_addr) ? (max_end - load_addr) : 0;
 
-    if (lib_dyn)
+    if (lib_dyn) {
         parse_dynamic(map, lib_dyn, base);
-    else
+        map->dyn_section = lib_dyn;
+    } else {
         map->base = base;
+    }
     if (tls_memsz != 0) {
         map->tls_template = tls_template + delta;
         map->tls_filesz = tls_filesz;

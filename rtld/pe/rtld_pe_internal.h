@@ -26,8 +26,10 @@ struct rtld_syscall_result {
 /* Architecture-specific syscall primitives */
 #if defined(__x86_64__)
 #include "../elf/arch/x86_64/rtld_syscall.h"
+#define PE_KERNEL32_CALL __attribute__((ms_abi))
 #elif defined(__aarch64__)
 #include "../elf/arch/aarch64/rtld_syscall.h"
+#define PE_KERNEL32_CALL
 #else
 #error "Unsupported architecture"
 #endif
@@ -144,8 +146,6 @@ static inline int pe_strcasecmp(const char *a, const char *b) {
 
 typedef uint64_t cap_t;
 
-#define CAP_PROCMGR_EP   3
-#define CAP_MMSRV_EP     7
 #define PM_EXIT_LABEL     2
 
 static inline struct rtld_syscall_result pe_syscall(
@@ -182,11 +182,8 @@ static inline void pe_yield(void) {
     pe_syscall(SYS_YIELD, 0, 0, 0, 0, 0, 0);
 }
 
-static inline void __attribute__((noreturn)) pe_exit(int code) {
-    uint64_t msg_info = ((uint64_t)PM_EXIT_LABEL << 12) | 1;
-    pe_syscall(SYS_CALL, CAP_PROCMGR_EP, msg_info, (uint64_t)code, 0, 0, 0);
-    for (;;) pe_yield();
-}
+/* Defined in rtld_pe_main.c; reads g_pe_rtld.cap_procmgr_ep. */
+void __attribute__((noreturn)) pe_exit(int code);
 
 /* ============================================================
  * PE/COFF Types
@@ -397,13 +394,49 @@ typedef struct {
 #define AT_TRONA_VSPACE        0x1001
 #define AT_TRONA_SCRATCH       0x1002
 #define AT_TRONA_IPC_BUFFER    0x100C
-#define AT_TRONA_SLOT_BASE     0x1007
-#define AT_TRONA_SLOT_COUNT    0x1008
+#define AT_TRONA_CSPACE_LAYOUT 0x1005
 #define AT_TRONA_CSPACE_NTFN   0x100A
-#define AT_TRONA_MM_EP         0x100B
 #define AT_TRONA_SC_CAP        0x100E
+
+/* Legacy per-cap AT_TRONA_*_EP / _NTFN / _UNTYPED / _IOPORT tags have
+ * been removed — every role-bearing cap is now delivered via the
+ * role-based startup cap_table (AT_TRONA_CAP_TABLE). */
 #define AT_SALTYOS_KERNEL32_BASE 0x2003
 #define AT_SALTYOS_KERNEL32_SIZE 0x2004
+
+/* `AT_TRONA_CAP_TABLE`, magic/version, all `ROLE_*`,
+ * `LOCAL_ROLE_BASE/END`, and `CAP_TBL_{RIGHT,FLAG}_*` are generated
+ * from `lib/trona/uapi/consts/kernel.rs`. meson adds the build dir
+ * to this translation unit's include path via `rtld_generated_dir`. */
+#include "cap_table_roles.h"
+
+struct trona_cap_entry_v1 {
+    uint32_t role_id;
+    uint32_t slot;
+    uint32_t rights;
+    uint32_t flags;
+};
+
+struct trona_cap_table_v1 {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t count;
+    uint32_t reserved;
+    /* Flexible array: `count` `trona_cap_entry_v1` records follow. */
+};
+
+struct trona_cspace_layout_v1 {
+    uint64_t version;
+    uint64_t flags;
+    uint64_t cnode_bits;
+    uint64_t frame_slot_base;
+    uint64_t alloc_base;
+    uint64_t alloc_limit;
+    uint64_t recv_base;
+    uint64_t recv_limit;
+    uint64_t expand_base;
+    uint64_t expand_limit;
+};
 
 struct kernel32_ipc_context {
     void *ipc_buffer;
@@ -423,14 +456,38 @@ struct pe_rtld_state {
     uint64_t kernel32_base;  /* Base VA of mapped kernel32.dll PE image */
     uint64_t kernel32_size;  /* Size of mapped kernel32.dll image */
     cap_t    vspace;         /* Self VSpace cap */
-    cap_t    mm_ep;          /* Badged mmsrv endpoint cap */
     uint64_t scratch_vaddr;  /* Scratch page VA */
     uint64_t ipc_buffer_vaddr; /* IPC buffer page VA */
     uint64_t rtld_base;      /* Load base of this rtld ELF */
-    uint64_t slot_base;
-    uint64_t slot_count;
+    struct trona_cspace_layout_v1 *cspace_layout;
     uint64_t cspace_ntfn;
     uint64_t sc_cap;
+
+    /* Cap slots PE rtld needs for its own operations (as opposed to
+     * writing into kernel32.dll or libtrona exports). Populated from
+     * the `ROLE_*` entries of the startup cap_table.
+     *
+     * - `cap_procmgr_ep`: used by `pe_exit` to send PM_EXIT and also
+     *   mirrored into kernel32.dll's `__trona_cap_procmgr_ep` export
+     *   during `initialize_kernel32_runtime`.
+     * - `cap_mmsrv_ep`:   used by PE rtld's own MAP_MO calls to lay
+     *   out the PE image / kernel32.dll mapping.
+     * - `cap_vfs_ep`:     mirrored into kernel32.dll's
+     *   `__trona_cap_vfs_ep` export for its file I/O shim.
+     *
+     * All other role-bearing caps (namesrv, signal, rsrcsrv, console,
+     * readiness, initrd_untyped, fb_untyped, pci/com1 ioports,
+     * service_ep) do not need a g_pe_rtld field — they are written
+     * straight into their libtrona / kernel32 weak symbols by the
+     * walker without a per-field mirror in rtld state. */
+    uint64_t cap_procmgr_ep;
+    uint64_t cap_mmsrv_ep;
+    uint64_t cap_vfs_ep;
+
+    /* Pointer to the child's startup capability table, from
+     * AT_TRONA_CAP_TABLE. NULL until stage-1 spawners emit it. Stage 2
+     * readers prefer this over the individual cap_* fields above. */
+    struct trona_cap_table_v1 *cap_table;
 };
 
 /* Convert PE section characteristics to VSpace flags (W^X enforced) */
