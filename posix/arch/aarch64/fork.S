@@ -2,8 +2,8 @@
  * SPDX-License-Identifier: GPL-2.0-only
  *
  * posix_fork() saves callee-saved GPRs and ALL NEON registers on the stack,
- * then calls _posix_fork_impl() which sends PM_FORK to procmgr with the
- * current SP and the address of fork_child_entry.
+ * then calls _posix_fork_impl() which sends INIT_FORK to the init server
+ * with the current SP and the address of fork_child_entry.
  *
  * _posix_fork_impl() is a Rust function that freely uses caller-saved NEON
  * registers (D0-D7, D16-D31) for struct copies and IPC message construction.
@@ -12,7 +12,7 @@
  * XMM0-XMM15 under SALTY_X86_SIMD.
  *
  * Parent path: _posix_fork_impl returns child PID, we restore all regs.
- * Child path: procmgr sets child RIP to fork_child_entry with saved SP.
+ * Child path: init sets child RIP to fork_child_entry with saved SP.
  */
 
 .text

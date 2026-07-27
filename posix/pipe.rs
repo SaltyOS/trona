@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! POSIX pipe, pipe2, dup/dup2/dup3, mkfifo operations.
 
-use trona::consts::kernel::*;
-use trona::protocol::*;
-use trona::types::core::*;
 use super::pack_path;
+use crate::*;
+use trona_kernel::core_types::*;
+use trona_protocol::posix::*;
 
 /// Create a pipe. Convenience wrapper for `posix_pipe2(fds, 0)`.
 pub unsafe fn posix_pipe(fds: *mut i32) -> i32 {
@@ -22,14 +22,20 @@ pub unsafe fn posix_pipe2(fds: *mut i32, flags: i32) -> i32 {
         msg.length = 1;
         msg.regs[0] = flags as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
-        *fds = reply.regs[0] as i32;       // read fd
+        *fds = reply.regs[0] as i32; // read fd
         *fds.add(1) = reply.regs[1] as i32; // write fd
         0
     }
@@ -44,11 +50,17 @@ pub unsafe fn posix_dup(oldfd: i32) -> i32 {
         msg.length = 1;
         msg.regs[0] = oldfd as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
@@ -66,11 +78,17 @@ pub unsafe fn posix_dup2(oldfd: i32, newfd: i32) -> i32 {
         msg.regs[0] = oldfd as u64;
         msg.regs[1] = newfd as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
@@ -89,11 +107,17 @@ pub unsafe fn posix_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
         msg.regs[1] = newfd as u64;
         msg.regs[2] = flags as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
@@ -107,15 +131,22 @@ pub unsafe fn posix_mkfifo(path: *const u8, mode: u32) -> i32 {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
         msg.label = VFS_POSIX_MKFIFO;
-        msg.regs[0] = mode as u64;
-        let path_len = pack_path(&raw mut msg, 1, path, 128);
-        msg.length = 2 + ((path_len as u64 + 7) / 8);
+        msg.regs[0] = super::consts::AT_FDCWD as u32 as u64;
+        msg.regs[1] = mode as u64;
+        let path_len = pack_path(&raw mut msg, 2, path, 128);
+        msg.length = 3 + ((path_len as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         0

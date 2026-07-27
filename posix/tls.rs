@@ -2,7 +2,7 @@
 //!
 //! The canonical TLS infrastructure (ThreadLocalBlock, MainTlsBlock, TLS
 //! initialization, TP register management, thread pool) now lives in the
-//! substrate crate (`trona::tls`). This module re-exports substrate types
+//! substrate crate (`trona_runtime::thread::tls`). This module re-exports substrate types
 //! for backward compatibility and provides POSIX-specific helpers:
 //!
 //! - `current_errno()` — per-thread errno with global fallback
@@ -10,20 +10,17 @@
 //!
 //! SPDX-License-Identifier: GPL-2.0-only
 
-// Re-export types from uapi for backward compat
-pub use trona::types::core::{
-    ThreadLocalBlock, CleanupHandler,
-    StaticTlsModule, MAX_STATIC_TLS_MODULES,
+// Re-export the TLS-block types from substrate so callers in this
+// crate's other modules and basaltc can use them through `trona_posix::tls::*`
+// without reaching into substrate directly.
+pub use trona_kernel::core_types::{
+    CleanupHandler, MAX_STATIC_TLS_MODULES, StaticTlsModule, ThreadLocalBlock,
 };
 
 // Re-export substrate TLS constants and functions used by sibling modules
-pub use trona::tls::{
-    MAX_ELF_TLS_SIZE,
-    abi_tcb_size,
-    static_tls_total_memsz,
-    static_tls_align,
-    initialize_static_tls_for_tp,
-    install_runtime_tcb_anchor,
+pub use trona_runtime::thread::tls::{
+    MAX_ELF_TLS_SIZE, abi_tcb_size, initialize_static_tls_for_tp, install_runtime_tcb_anchor,
+    static_tls_align, static_tls_total_memsz,
 };
 
 /// Delegate to the substrate's `current_tls()`.
@@ -32,7 +29,7 @@ pub use trona::tls::{
 /// has not been initialized for this process.
 #[inline]
 pub fn current_tls() -> Option<*mut ThreadLocalBlock> {
-    trona::tls::current_tls()
+    trona_runtime::thread::tls::current_tls()
 }
 
 /// Delegate to the substrate's `current_ipc_ctx()`.
@@ -40,8 +37,8 @@ pub fn current_tls() -> Option<*mut ThreadLocalBlock> {
 /// Returns the per-thread IPC context if TLS is active, otherwise
 /// falls back to the global `__trona_ipc_ctx`.
 #[inline]
-pub fn current_ipc_ctx() -> *mut trona::types::core::IpcContext {
-    trona::tls::current_ipc_ctx()
+pub fn current_ipc_ctx() -> *mut trona_kernel::core_types::IpcContext {
+    trona_runtime::thread::tls::current_ipc_ctx()
 }
 
 /// Get a pointer to the current thread's errno from TLS.
@@ -62,9 +59,9 @@ static mut GLOBAL_ERRNO: i32 = 0;
 
 /// Resolve a TLS variable address for the current thread.
 ///
-/// Delegates to `trona::tls::tls_addr()`.
+/// Delegates to `trona_runtime::thread::tls::tls_addr()`.
 pub unsafe fn tls_addr(module_id: u64, offset: u64) -> *mut u8 {
-    unsafe { trona::tls::tls_addr(module_id, offset) }
+    unsafe { trona_runtime::thread::tls::tls_addr(module_id, offset) }
 }
 
 /// Initialize TLS for the main thread — POSIX personality wrapper.
@@ -80,12 +77,12 @@ pub unsafe fn tls_addr(module_id: u64, offset: u64) -> *mut u8 {
 /// any other threads are created.
 pub unsafe fn init_main_thread_tls() {
     unsafe {
-        trona::tls::init_main_thread_tls();
+        trona_runtime::thread::tls::init_main_thread_tls();
 
         // Install the POSIX cancellation hook into the substrate sync layer
         // so that blocking primitives (Condvar::wait, etc.) can invoke
         // pthread_testcancel() when a cancellation is pending.
-        trona::sync::install_cancel_hook(posix_cancel_impl);
+        trona_runtime::thread::sync::install_cancel_hook(posix_cancel_impl);
 
         // After substrate TLS init, initialize the POSIX personality
         // for the main thread's descriptor.

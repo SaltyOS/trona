@@ -11,9 +11,9 @@ pub type DWORD = u32;
 pub type BOOL = i32;
 
 pub const INVALID_HANDLE_VALUE: HANDLE = -1;
-pub const STD_INPUT_HANDLE: DWORD = 0xFFFF_FFF6;  // -10 as u32
-pub const STD_OUTPUT_HANDLE: DWORD = 0xFFFF_FFF5;  // -11 as u32
-pub const STD_ERROR_HANDLE: DWORD = 0xFFFF_FFF4;   // -12 as u32
+pub const STD_INPUT_HANDLE: DWORD = 0xFFFF_FFF6; // -10 as u32
+pub const STD_OUTPUT_HANDLE: DWORD = 0xFFFF_FFF5; // -11 as u32
+pub const STD_ERROR_HANDLE: DWORD = 0xFFFF_FFF4; // -12 as u32
 
 pub const TRUE: BOOL = 1;
 pub const FALSE: BOOL = 0;
@@ -60,14 +60,28 @@ unsafe fn seed_std_handles() {
         for i in 0..MAX_HANDLES {
             (*table)[i] = HandleEntry::zeroed();
         }
-        (*table)[0] = HandleEntry { kind: HandleKind::VfsFd, vfs_fd: 0, cap_slot: 0 };
-        (*table)[1] = HandleEntry { kind: HandleKind::VfsFd, vfs_fd: 1, cap_slot: 0 };
-        (*table)[2] = HandleEntry { kind: HandleKind::VfsFd, vfs_fd: 2, cap_slot: 0 };
+        (*table)[0] = HandleEntry {
+            kind: HandleKind::VfsFd,
+            vfs_fd: -1,
+            cap_slot: 0,
+        };
+        (*table)[1] = HandleEntry {
+            kind: HandleKind::VfsFd,
+            vfs_fd: -1,
+            cap_slot: 0,
+        };
+        (*table)[2] = HandleEntry {
+            kind: HandleKind::VfsFd,
+            vfs_fd: -1,
+            cap_slot: 0,
+        };
     }
 }
 
 /// Initialize the handle table with standard I/O handles.
-/// Slot 0 = stdin (VFS fd 0), Slot 1 = stdout (VFS fd 1), Slot 2 = stderr (VFS fd 2).
+/// Slot 0 = stdin, Slot 1 = stdout, Slot 2 = stderr. The VFS-side NT
+/// handles are opened lazily by kernel32 so Win32 stdio enters VFS through
+/// the same `NtOpenFile` path as regular Win32 file handles.
 pub unsafe fn init_handle_table() {
     unsafe {
         if *(&raw const HANDLE_TABLE_INIT) {
@@ -106,9 +120,9 @@ pub fn slot_to_handle(slot: usize) -> HANDLE {
 /// Resolve STD_*_HANDLE constants to their HANDLE values.
 pub fn std_handle_to_handle(n_std_handle: DWORD) -> HANDLE {
     match n_std_handle {
-        STD_INPUT_HANDLE => slot_to_handle(0),   // HANDLE = 4
-        STD_OUTPUT_HANDLE => slot_to_handle(1),   // HANDLE = 8
-        STD_ERROR_HANDLE => slot_to_handle(2),    // HANDLE = 12
+        STD_INPUT_HANDLE => slot_to_handle(0),  // HANDLE = 4
+        STD_OUTPUT_HANDLE => slot_to_handle(1), // HANDLE = 8
+        STD_ERROR_HANDLE => slot_to_handle(2),  // HANDLE = 12
         _ => INVALID_HANDLE_VALUE,
     }
 }
@@ -144,6 +158,21 @@ pub unsafe fn alloc_vfs_fd(fd: i32) -> HANDLE {
         }
         INVALID_HANDLE_VALUE
     }
+}
+
+pub unsafe fn set_vfs_fd_slot(slot: usize, fd: i32) -> bool {
+    if slot >= MAX_HANDLES {
+        return false;
+    }
+    unsafe {
+        let table = &raw mut HANDLE_TABLE;
+        (*table)[slot] = HandleEntry {
+            kind: HandleKind::VfsFd,
+            vfs_fd: fd,
+            cap_slot: 0,
+        };
+    }
+    true
 }
 
 /// Close a handle, freeing the slot.

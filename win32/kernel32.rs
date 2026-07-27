@@ -4,23 +4,28 @@
 #![no_std]
 #![no_main]
 
+extern crate uapi;
+
 pub mod console;
 pub mod crt;
 pub mod error;
 pub mod handle;
+pub mod ipc;
 pub mod paths;
+pub mod pe_types;
 pub mod process;
-pub mod protocol;
-pub mod trona;
+pub mod runtime;
+pub mod syscall;
+pub mod types;
 
 pub use handle::HANDLE;
-pub use protocol::*;
+pub use trona_protocol::win32::*;
 
 use core::panic::PanicInfo;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {
-        let _ = trona::syscall::syscall(trona::consts::kernel::SYS_YIELD, 0, 0, 0, 0, 0, 0);
+        syscall::yield_now();
     }
 }

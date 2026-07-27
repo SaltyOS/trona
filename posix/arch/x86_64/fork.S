@@ -3,13 +3,13 @@
  *
  * posix_fork() saves callee-saved GPRs and (when enabled) XMM0-15 on the
  * stack, then calls
- * _posix_fork_impl() which sends PM_FORK to procmgr with the current
- * RSP and the address of fork_child_entry.
+ * _posix_fork_impl() which sends INIT_FORK to the init server with the
+ * current RSP and the address of fork_child_entry.
  *
  * Parent path: _posix_fork_impl returns child PID, we pop saved regs,
  * return the PID to the caller.
  *
- * Child path: procmgr sets the child's RIP to fork_child_entry with
+ * Child path: init sets the child's RIP to fork_child_entry with
  * the same RSP the parent had after pushing regs. The child pops the
  * saved registers and returns 0.
  */

@@ -3,15 +3,19 @@
 //!
 //! Supports both AF_UNIX (path-based) and AF_INET (ip+port-based) sockets.
 
-use trona::consts::kernel::*;
-use trona::consts::posix::*;
-use trona::consts::server::*;
-use trona::protocol::*;
-use trona::types::core::*;
-use trona::types::posix::*;
 use super::pack_path;
+use crate::*;
+// posix consts already in scope via lib.rs `pub use crate::consts::*`
+use crate::types::*;
+use trona_kernel::core_types::*;
+use trona_protocol::posix::*;
+use trona_protocol::vfs::public::{
+    VFS_RECVMSG_FLAG_WANT_ADDR, VFS_RECVMSG_FLAG_WANT_RIGHTS, VFS_SENDMSG_FLAG_INET_ADDR,
+    VFS_SENDMSG_FLAG_LOCAL_ADDR,
+};
 
 const POSIX_MSG_PEEK: i32 = 0x02;
+const UNIX_ADDR_ABSTRACT_FLAG: u64 = 1 << 63;
 
 #[inline]
 fn inet_recv_wire_flags(flags: i32) -> u32 {
@@ -54,6 +58,89 @@ unsafe fn pack_sockopt_value(optval: *const u8, optlen: u32) -> Result<u64, i32>
     Ok(value)
 }
 
+#[inline]
+fn unix_addr_wire_len(encoded_len: u64) -> (usize, bool, u64) {
+    let is_abstract = (encoded_len & UNIX_ADDR_ABSTRACT_FLAG) != 0;
+    let name_len = (encoded_len & !UNIX_ADDR_ABSTRACT_FLAG) as usize;
+    let inline_len = if is_abstract {
+        name_len
+    } else {
+        name_len.saturating_add(1)
+    };
+    (name_len, is_abstract, ((inline_len as u64) + 7) / 8)
+}
+
+unsafe fn pack_unix_addr(
+    msg: *mut TronaMsg,
+    len_reg: usize,
+    addr: *const u8,
+    addr_len: u32,
+) -> Result<u64, i32> {
+    unsafe {
+        if addr.is_null() || addr_len < 2 {
+            return Err(-22); // EINVAL
+        }
+        if *(addr as *const u16) != AF_UNIX as u16 {
+            return Err(-97); // EAFNOSUPPORT
+        }
+
+        let path = addr.add(2);
+        let max = (addr_len - 2) as usize;
+        if max != 0 && *path == 0 {
+            let name_len = core::cmp::min(
+                max.saturating_sub(1),
+                SockAddrUn::zeroed().sun_path.len().saturating_sub(1),
+            );
+            let dst = &mut (*msg).regs[len_reg + 1] as *mut u64 as *mut u8;
+            if name_len != 0 {
+                ::core::ptr::copy_nonoverlapping(path.add(1), dst, name_len);
+            }
+            (*msg).regs[len_reg] = UNIX_ADDR_ABSTRACT_FLAG | name_len as u64;
+            return Ok(((name_len as u64) + 7) / 8);
+        }
+
+        let path_len = pack_path(msg, len_reg, path, max);
+        Ok(((path_len as u64 + 1) + 7) / 8)
+    }
+}
+
+unsafe fn unpack_unix_addr(
+    addr: *mut u8,
+    addr_len: *mut u32,
+    encoded_len: u64,
+    src: *const u8,
+) -> i32 {
+    unsafe {
+        if addr.is_null() || addr_len.is_null() || *addr_len < 2 {
+            return -22; // EINVAL
+        }
+        let sa = &mut *(addr as *mut SockAddrUn);
+        sa.sun_family = AF_UNIX as u16;
+        sa.sun_path.fill(0);
+
+        let (name_len, is_abstract, _) = unix_addr_wire_len(encoded_len);
+        if is_abstract {
+            let actual_name = ::core::cmp::min(name_len, sa.sun_path.len().saturating_sub(1));
+            if actual_name != 0 {
+                ::core::ptr::copy_nonoverlapping(src, sa.sun_path.as_mut_ptr().add(1), actual_name);
+            }
+            *addr_len = (2 + 1 + actual_name) as u32;
+        } else {
+            let actual_path = ::core::cmp::min(name_len, sa.sun_path.len().saturating_sub(1));
+            if actual_path != 0 {
+                ::core::ptr::copy_nonoverlapping(src, sa.sun_path.as_mut_ptr(), actual_path);
+            }
+            sa.sun_path[actual_path] = 0;
+            *addr_len = if actual_path == 0 {
+                2
+            } else {
+                (2 + actual_path + 1) as u32
+            };
+        }
+        0
+    }
+}
+
 /// Create a socket. `domain` is AF_UNIX or AF_INET.
 /// Returns the socket fd on success, -1 on error.
 pub unsafe fn posix_socket(domain: i32, sock_type: i32, protocol: i32) -> i32 {
@@ -66,11 +153,17 @@ pub unsafe fn posix_socket(domain: i32, sock_type: i32, protocol: i32) -> i32 {
         msg.regs[1] = sock_type as u64;
         msg.regs[2] = protocol as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
@@ -107,17 +200,24 @@ pub unsafe fn posix_bind(fd: i32, addr: *const u8, addr_len: u32) -> i32 {
             msg.length = 4;
         } else {
             // AF_UNIX: pack path from SockAddrUn.sun_path (offset 2 in struct)
-            let path = addr.add(2);
-            let max = (addr_len - 2) as usize;
-            let path_len = pack_path(&raw mut msg, 1, path, max);
-            msg.length = 2 + ((path_len as u64 + 7) / 8);
+            let path_regs = match pack_unix_addr(&raw mut msg, 1, addr, addr_len) {
+                Ok(regs) => regs,
+                Err(err) => return err,
+            };
+            msg.length = 2 + path_regs;
         }
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         0
@@ -135,11 +235,17 @@ pub unsafe fn posix_listen(fd: i32, backlog: i32) -> i32 {
         msg.regs[0] = fd as u64;
         msg.regs[1] = backlog as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         0
@@ -156,14 +262,20 @@ pub unsafe fn posix_accept(fd: i32) -> i32 {
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-        if err == TRONA_INTERRUPTED as i32 {
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
             return -4; // EINTR
         }
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         reply.regs[0] as i32
@@ -194,25 +306,33 @@ pub unsafe fn posix_connect(fd: i32, addr: *const u8, addr_len: u32) -> i32 {
                 return -22; // EINVAL
             }
             let (ip, port) = sockaddr_in_to_host(addr);
-            msg.regs[1] = ip as u64;
-            msg.regs[2] = port as u64;
-            msg.length = 3;
+            msg.regs[1] = AF_INET as u64;
+            msg.regs[2] = ip as u64;
+            msg.regs[3] = port as u64;
+            msg.length = 4;
         } else {
             // AF_UNIX: pack path from SockAddrUn.sun_path (offset 2 in struct)
-            let path = addr.add(2);
-            let max = (addr_len - 2) as usize;
-            let path_len = pack_path(&raw mut msg, 1, path, max);
-            msg.length = 2 + ((path_len as u64 + 7) / 8);
+            let path_regs = match pack_unix_addr(&raw mut msg, 1, addr, addr_len) {
+                Ok(regs) => regs,
+                Err(err) => return err,
+            };
+            msg.length = 2 + path_regs;
         }
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-        if err == TRONA_INTERRUPTED as i32 {
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
             return -4; // EINTR
         }
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         0
@@ -230,24 +350,30 @@ pub unsafe fn posix_shutdown(fd: i32, how: i32) -> i32 {
         msg.regs[0] = fd as u64;
         msg.regs[1] = how as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         0
     }
 }
 
-/// Return the local address of a socket into a host-order `SockAddrIn`.
+/// Return the local address of a socket into `SockAddrIn` or `SockAddrUn`.
 pub unsafe fn posix_getsockname(fd: i32, addr: *mut u8, addr_len: *mut u32) -> i32 {
     unsafe {
         if addr.is_null() || addr_len.is_null() {
             return -14; // EFAULT
         }
-        if *addr_len < ::core::mem::size_of::<SockAddrIn>() as u32 {
+        if *addr_len < 2 {
             return -22; // EINVAL
         }
 
@@ -257,14 +383,32 @@ pub unsafe fn posix_getsockname(fd: i32, addr: *mut u8, addr_len: *mut u32) -> i
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
-        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
 
+        if reply.length >= 3 && reply.regs[0] == AF_UNIX as u64 {
+            return unpack_unix_addr(
+                addr,
+                addr_len,
+                reply.regs[1],
+                &reply.regs[2] as *const u64 as *const u8,
+            );
+        }
+
+        if *addr_len < ::core::mem::size_of::<SockAddrIn>() as u32 {
+            return -22; // EINVAL
+        }
         let sa = &mut *(addr as *mut SockAddrIn);
         sa.family = AF_INET as u16;
         sa.port = reply.regs[1] as u16;
@@ -274,13 +418,13 @@ pub unsafe fn posix_getsockname(fd: i32, addr: *mut u8, addr_len: *mut u32) -> i
     }
 }
 
-/// Return the peer address of a connected socket into a host-order `SockAddrIn`.
+/// Return the peer address of a connected socket into `SockAddrIn` or `SockAddrUn`.
 pub unsafe fn posix_getpeername(fd: i32, addr: *mut u8, addr_len: *mut u32) -> i32 {
     unsafe {
         if addr.is_null() || addr_len.is_null() {
             return -14; // EFAULT
         }
-        if *addr_len < ::core::mem::size_of::<SockAddrIn>() as u32 {
+        if *addr_len < 2 {
             return -22; // EINVAL
         }
 
@@ -290,14 +434,32 @@ pub unsafe fn posix_getpeername(fd: i32, addr: *mut u8, addr_len: *mut u32) -> i
         msg.length = 1;
         msg.regs[0] = fd as u64;
 
-        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
 
+        if reply.length >= 3 && reply.regs[0] == AF_UNIX as u64 {
+            return unpack_unix_addr(
+                addr,
+                addr_len,
+                reply.regs[1],
+                &reply.regs[2] as *const u64 as *const u8,
+            );
+        }
+
+        if *addr_len < ::core::mem::size_of::<SockAddrIn>() as u32 {
+            return -22; // EINVAL
+        }
         let sa = &mut *(addr as *mut SockAddrIn);
         sa.family = AF_INET as u16;
         sa.port = reply.regs[1] as u16;
@@ -331,11 +493,17 @@ pub unsafe fn posix_setsockopt(
         msg.regs[3] = value;
         msg.regs[4] = optlen as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         0
@@ -363,11 +531,17 @@ pub unsafe fn posix_getsockopt(
         msg.regs[1] = level as u64;
         msg.regs[2] = optname as u64;
 
-        let err = crate::ipc_call_retry_idempotent(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
 
@@ -383,18 +557,27 @@ pub unsafe fn posix_getsockopt(
 
 /// Create a pair of connected Unix domain sockets.
 /// On success, writes `fds[0]` and `fds[1]` and returns 0.
-pub unsafe fn posix_socketpair(fds: *mut i32) -> i32 {
+pub unsafe fn posix_socketpair(domain: i32, sock_type: i32, protocol: i32, fds: *mut i32) -> i32 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
         msg.label = VFS_POSIX_SOCKPAIR;
-        msg.length = 0;
+        msg.length = 3;
+        msg.regs[0] = domain as u64;
+        msg.regs[1] = sock_type as u64;
+        msg.regs[2] = protocol as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
         if err != 0 {
             return super::call_err_to_posix(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label);
         }
         if !fds.is_null() {
@@ -410,7 +593,13 @@ pub unsafe fn posix_socketpair(fds: *mut i32) -> i32 {
 /// `data`/`data_len` is the payload (max 120 bytes per call).
 /// `fds_to_send`/`fd_count` lists file descriptors to pass via SCM_RIGHTS
 /// (max 4 per call). Returns bytes sent on success, negative errno on error.
-pub unsafe fn posix_sendmsg(fd: i32, data: *const u8, data_len: u64, fds_to_send: *const i32, fd_count: u32) -> i64 {
+pub unsafe fn posix_sendmsg(
+    fd: i32,
+    data: *const u8,
+    data_len: u64,
+    fds_to_send: *const i32,
+    fd_count: u32,
+) -> i64 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
@@ -439,14 +628,87 @@ pub unsafe fn posix_sendmsg(fd: i32, data: *const u8, data_len: u64, fds_to_send
 
         msg.length = 3 + data_regs + ((actual_fds as u64 * 4 + 7) / 8);
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-        if err == TRONA_INTERRUPTED as i32 {
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
             return -4; // EINTR
         }
         if err != 0 {
             return super::call_err_to_posix_i64(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
+            return super::trona_err_to_posix(reply.label) as i64;
+        }
+        reply.regs[0] as i64
+    }
+}
+
+/// Send a local AF_UNIX datagram message with an explicit destination path
+/// and optional SCM_RIGHTS payload.
+pub unsafe fn posix_sendmsg_local(
+    fd: i32,
+    data: *const u8,
+    data_len: u64,
+    fds_to_send: *const i32,
+    fd_count: u32,
+    addr: *const u8,
+    addr_len: u32,
+) -> i64 {
+    unsafe {
+        if addr.is_null() || addr_len < 2 {
+            return -22; // EINVAL
+        }
+        if *(addr as *const u16) != AF_UNIX as u16 {
+            return -97; // EAFNOSUPPORT
+        }
+
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        msg.label = VFS_POSIX_SENDMSG;
+        msg.regs[0] = fd as u64;
+
+        let actual_data = core::cmp::min(data_len, 120);
+        let actual_fds = core::cmp::min(fd_count, 4);
+        let path_regs = match pack_unix_addr(&raw mut msg, 3, addr, addr_len) {
+            Ok(regs) => regs,
+            Err(err) => return err as i64,
+        };
+        msg.regs[1] = actual_data;
+        msg.regs[2] = (VFS_SENDMSG_FLAG_LOCAL_ADDR | actual_fds) as u64;
+
+        let data_base = 4usize + path_regs as usize;
+        let data_dst = &mut msg.regs[data_base] as *mut u64 as *mut u8;
+        for i in 0..actual_data as usize {
+            *data_dst.add(i) = *data.add(i);
+        }
+
+        let data_regs = (actual_data + 7) / 8;
+        let fd_dst = &mut msg.regs[data_base + data_regs as usize] as *mut u64 as *mut i32;
+        for i in 0..actual_fds as usize {
+            *fd_dst.add(i) = *fds_to_send.add(i);
+        }
+
+        msg.length = data_base as u64 + data_regs + ((actual_fds as u64 * 4 + 7) / 8);
+
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
+            return -4; // EINTR
+        }
+        if err != 0 {
+            return super::call_err_to_posix_i64(err);
+        }
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label) as i64;
         }
         reply.regs[0] as i64
@@ -457,24 +719,45 @@ pub unsafe fn posix_sendmsg(fd: i32, data: *const u8, data_len: u64, fds_to_send
 ///
 /// Reads up to `data_len` bytes into `data`. Received file descriptors
 /// (SCM_RIGHTS) are written to `fds_out`, with `*fd_count` updated to the
-/// actual number received. Returns bytes received, negative errno on error.
-pub unsafe fn posix_recvmsg(fd: i32, data: *mut u8, data_len: u64, fds_out: *mut i32, fd_count: *mut u32) -> i64 {
+/// actual number received. `flags` carries the POSIX `recvmsg` flags —
+/// only `MSG_CMSG_CLOEXEC` is interpreted today and propagated to VFS so
+/// that newly installed fds inherit `FD_CLOEXEC` when requested. Returns
+/// bytes received, negative errno on error.
+pub unsafe fn posix_recvmsg(
+    fd: i32,
+    data: *mut u8,
+    data_len: u64,
+    fds_out: *mut i32,
+    fd_count: *mut u32,
+    flags: i32,
+) -> i64 {
     unsafe {
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
+        let mut wire_flags = flags;
+        if !fds_out.is_null() && !fd_count.is_null() && *fd_count != 0 {
+            wire_flags |= VFS_RECVMSG_FLAG_WANT_RIGHTS as i32;
+        }
         msg.label = VFS_POSIX_RECVMSG;
-        msg.length = 2;
+        msg.length = 3;
         msg.regs[0] = fd as u64;
         msg.regs[1] = data_len;
+        msg.regs[2] = wire_flags as u32 as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-        if err == TRONA_INTERRUPTED as i32 {
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
             return -4; // EINTR
         }
         if err != 0 {
             return super::call_err_to_posix_i64(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label) as i64;
         }
 
@@ -494,7 +777,11 @@ pub unsafe fn posix_recvmsg(fd: i32, data: *mut u8, data_len: u64, fds_out: *mut
         let fd_src = &reply.regs[2 + data_regs as usize] as *const u64 as *const i32;
         if !fds_out.is_null() && !fd_count.is_null() {
             let max_fds = *fd_count;
-            let copy_fds = if actual_fds < max_fds { actual_fds } else { max_fds };
+            let copy_fds = if actual_fds < max_fds {
+                actual_fds
+            } else {
+                max_fds
+            };
             for i in 0..copy_fds as usize {
                 *fds_out.add(i) = *fd_src.add(i);
             }
@@ -527,12 +814,43 @@ pub unsafe fn posix_sendto(
         msg.regs[1] = actual as u64;
         msg.regs[2] = 0; // no fds
 
-        // Check if this is an AF_INET sendto
-        if !addr.is_null() && addr_len >= 8 {
+        // Check if this is a sockaddr-targeted sendto
+        if !addr.is_null() && addr_len >= 2 {
             let family = *(addr as *const u16);
+            if family == AF_UNIX as u16 {
+                let path_regs = match pack_unix_addr(&raw mut msg, 3, addr, addr_len) {
+                    Ok(regs) => regs,
+                    Err(err) => return err as i64,
+                };
+                msg.regs[2] = VFS_SENDMSG_FLAG_LOCAL_ADDR as u64;
+                let dst = (&mut msg.regs[4] as *mut u64 as *mut u8).add((path_regs * 8) as usize);
+                for i in 0..actual {
+                    *dst.add(i) = *data.add(i);
+                }
+                msg.length = 4 + path_regs + ((actual as u64 + 7) / 8);
+
+                let err = trona_kernel::ipc::mp_call_ctx(
+                    crate::tls::current_ipc_ctx(),
+                    trona_runtime::client::caps::vfs_ep().addr(),
+                    &raw const msg,
+                    &raw mut reply,
+                    trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+                );
+                if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
+                    return -4; // EINTR
+                }
+                if err != 0 {
+                    return super::call_err_to_posix_i64(err);
+                }
+                if reply.label != (uapi::KERNITE_OK as u64) {
+                    return super::trona_err_to_posix(reply.label) as i64;
+                }
+                return reply.regs[0] as i64;
+            }
             if family == AF_INET as u16 {
                 let (ip, port) = sockaddr_in_to_host(addr);
                 // Pack: regs[3]=dst_ip, regs[4]=dst_port, regs[5..]=data
+                msg.regs[2] = VFS_SENDMSG_FLAG_INET_ADDR as u64;
                 msg.regs[3] = ip as u64;
                 msg.regs[4] = port as u64;
                 let dst = &mut msg.regs[5] as *mut u64 as *mut u8;
@@ -541,14 +859,20 @@ pub unsafe fn posix_sendto(
                 }
                 msg.length = 5 + ((actual as u64 + 7) / 8);
 
-                let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-                if err == TRONA_INTERRUPTED as i32 {
+                let err = trona_kernel::ipc::mp_call_ctx(
+                    crate::tls::current_ipc_ctx(),
+                    trona_runtime::client::caps::vfs_ep().addr(),
+                    &raw const msg,
+                    &raw mut reply,
+                    trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+                );
+                if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
                     return -4; // EINTR
                 }
                 if err != 0 {
                     return super::call_err_to_posix_i64(err);
                 }
-                if reply.label != TRONA_OK {
+                if reply.label != (uapi::KERNITE_OK as u64) {
                     return super::trona_err_to_posix(reply.label) as i64;
                 }
                 return reply.regs[0] as i64;
@@ -562,17 +886,124 @@ pub unsafe fn posix_sendto(
         }
         msg.length = 3 + ((actual as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-        if err == TRONA_INTERRUPTED as i32 {
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
             return -4; // EINTR
         }
         if err != 0 {
             return super::call_err_to_posix_i64(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label) as i64;
         }
         reply.regs[0] as i64
+    }
+}
+
+/// Receive data and sender path from a local AF_UNIX socket.
+pub unsafe fn posix_recvfrom_local(
+    fd: i32,
+    data: *mut u8,
+    data_len: usize,
+    flags: i32,
+    addr: *mut u8,
+    addr_len: *mut u32,
+) -> i64 {
+    unsafe {
+        posix_recvmsg_local(
+            fd,
+            data,
+            data_len as u64,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            flags,
+            addr,
+            addr_len,
+        )
+    }
+}
+
+/// Receive data, optional sender pathname, and optional SCM_RIGHTS payload
+/// from a local AF_UNIX socket.
+pub unsafe fn posix_recvmsg_local(
+    fd: i32,
+    data: *mut u8,
+    data_len: u64,
+    fds_out: *mut i32,
+    fd_count: *mut u32,
+    flags: i32,
+    addr: *mut u8,
+    addr_len: *mut u32,
+) -> i64 {
+    unsafe {
+        let mut msg = TronaMsg::zeroed();
+        let mut reply = TronaMsg::zeroed();
+        let mut wire_flags = flags | VFS_RECVMSG_FLAG_WANT_ADDR as i32;
+        if !fds_out.is_null() && !fd_count.is_null() && *fd_count != 0 {
+            wire_flags |= VFS_RECVMSG_FLAG_WANT_RIGHTS as i32;
+        }
+        msg.label = VFS_POSIX_RECVMSG;
+        msg.length = 3;
+        msg.regs[0] = fd as u64;
+        msg.regs[1] = data_len;
+        msg.regs[2] = (wire_flags as u32) as u64;
+
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
+            return -4;
+        }
+        if err != 0 {
+            return super::call_err_to_posix_i64(err);
+        }
+        if reply.label != (uapi::KERNITE_OK as u64) {
+            return super::trona_err_to_posix(reply.label) as i64;
+        }
+
+        let actual_data = reply.regs[0] as usize;
+        let (_, _, path_regs) = unix_addr_wire_len(reply.regs[1]);
+        let want_rights = (wire_flags & VFS_RECVMSG_FLAG_WANT_RIGHTS as i32) != 0;
+        let actual_fds = if want_rights { reply.regs[2] as u32 } else { 0 };
+        let path_base = if want_rights { 3usize } else { 2usize };
+        let data_src =
+            (&reply.regs[path_base] as *const u64 as *const u8).add((path_regs * 8) as usize);
+        let copy_len = core::cmp::min(actual_data, data_len as usize);
+        for i in 0..copy_len {
+            *data.add(i) = *data_src.add(i);
+        }
+
+        if !addr.is_null() && !addr_len.is_null() && *addr_len >= 2 {
+            let path_src = &reply.regs[path_base] as *const u64 as *const u8;
+            let unpack = unpack_unix_addr(addr, addr_len, reply.regs[1], path_src);
+            if unpack != 0 {
+                return unpack as i64;
+            }
+        }
+
+        if !fds_out.is_null() && !fd_count.is_null() {
+            let max_fds = *fd_count;
+            let copy_fds = core::cmp::min(actual_fds, max_fds);
+            let data_regs = (actual_data as u64 + 7) / 8;
+            let fd_src = &reply.regs[path_base + path_regs as usize + data_regs as usize]
+                as *const u64 as *const i32;
+            for i in 0..copy_fds as usize {
+                *fds_out.add(i) = *fd_src.add(i);
+            }
+            *fd_count = actual_fds;
+        }
+
+        actual_data as i64
     }
 }
 
@@ -601,14 +1032,20 @@ pub unsafe fn posix_recvfrom(
             0
         } | inet_recv_wire_flags(flags)) as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-        if err == TRONA_INTERRUPTED as i32 {
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
             return -4; // EINTR
         }
         if err != 0 {
             return super::call_err_to_posix_i64(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label) as i64;
         }
 
@@ -618,7 +1055,11 @@ pub unsafe fn posix_recvfrom(
 
         // Unpack data from regs[4..]; regs[3] carries timestamp metadata.
         let src = &reply.regs[4] as *const u64 as *const u8;
-        let copy_len = if actual_data < data_len { actual_data } else { data_len };
+        let copy_len = if actual_data < data_len {
+            actual_data
+        } else {
+            data_len
+        };
         for i in 0..copy_len {
             *data.add(i) = *src.add(i);
         }
@@ -647,14 +1088,20 @@ pub unsafe fn posix_recv_inet(fd: i32, data: *mut u8, data_len: usize, flags: i3
         msg.regs[1] = data_len as u64;
         msg.regs[2] = inet_recv_wire_flags(flags) as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-        if err == TRONA_INTERRUPTED as i32 {
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
             return -4; // EINTR
         }
         if err != 0 {
             return super::call_err_to_posix_i64(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label) as i64;
         }
 
@@ -697,14 +1144,20 @@ pub unsafe fn posix_recvmsg_inet(
         msg.regs[1] = data_len;
         msg.regs[2] = flags as u64;
 
-        let err = crate::ipc_call_retry(trona::caps::vfs_ep(), &raw const msg, &raw mut reply);
-        if err == TRONA_INTERRUPTED as i32 {
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::vfs_ep().addr(),
+            &raw const msg,
+            &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
+        );
+        if err == (uapi::KERNITE_ERR_INTERRUPTED as u64) as i32 {
             return -4; // EINTR
         }
         if err != 0 {
             return super::call_err_to_posix_i64(err);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return super::trona_err_to_posix(reply.label) as i64;
         }
 

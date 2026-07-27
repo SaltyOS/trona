@@ -5,16 +5,18 @@
 //! The default path resolves dnssrv lazily via namesrv and caches the
 //! resulting endpoint capability for subsequent lookups.
 
-use trona::consts::kernel::*;
-use trona::consts::posix::*;
-use trona::consts::server::*;
-use trona::invoke;
-use trona::ipc;
-use trona::protocol::*;
-use trona::slot_alloc;
 use crate::tls;
-use trona::types::core::*;
-use trona::types::posix::*;
+use crate::*;
+// posix consts already in scope via lib.rs `pub use crate::consts::*`
+use crate::types::*;
+use trona_kernel::core_types::*;
+use trona_kernel::invoke;
+use trona_kernel::ipc;
+use trona_protocol::namesrv::NAMESRV_LOOKUP;
+use trona_protocol::posix::*;
+use trona_runtime::core::slot_alloc;
+
+const CAP_SELF_CSPACE: CapRef = CapRef::flat(uapi::KERNITE_CAP_SELF_CSPACE as u64);
 
 /// Cached dnssrv endpoint resolved lazily through namesrv.
 static mut DNSSRV_EP: Cap = 0;
@@ -35,7 +37,7 @@ unsafe fn resolve_dnssrv_ep() -> Result<Cap, u64> {
             } else {
                 let slot = match slot_alloc::slot_alloc() {
                     Some(slot) => slot,
-                    None => return Err(TRONA_OUT_OF_MEMORY),
+                    None => return Err(uapi::KERNITE_ERR_OUT_OF_MEMORY as u64),
                 };
                 *(&raw mut DNSSRV_LOOKUP_SLOT) = slot;
                 slot
@@ -43,27 +45,34 @@ unsafe fn resolve_dnssrv_ep() -> Result<Cap, u64> {
         };
 
         let _ = invoke::cnode_delete(CAP_SELF_CSPACE, ep_slot);
-        ipc::set_receive_slot_ctx(tls::current_ipc_ctx(), CAP_SELF_CSPACE, ep_slot, 0);
+        trona_runtime::core::ipc_ext::set_receive_slot_ctx(
+            tls::current_ipc_ctx(),
+            CAP_SELF_CSPACE.addr(),
+            ep_slot,
+            0,
+        );
 
         let name = b"dnssrv";
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = NS_LOOKUP;
+        msg.label = NAMESRV_LOOKUP;
         msg.regs[0] = name.len() as u64;
         msg.length = 1 + (name.len() as u64 + 7) / 8;
 
         let dst = &raw mut msg.regs[1] as *mut u8;
         ::core::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
 
-        let err = crate::ipc_call_retry_idempotent(
-            trona::caps::namesrv_ep(),
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::namesrv_ep().addr(),
             &raw const msg,
             &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         );
         if err != 0 {
             return Err(err as u64);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return Err(reply.label);
         }
 
@@ -72,10 +81,13 @@ unsafe fn resolve_dnssrv_ep() -> Result<Cap, u64> {
     }
 }
 
-unsafe fn dns_resolve_multi_result_with_ep(hostname: &[u8], dnssrv_ep: u64) -> Result<DnsResult, u64> {
+unsafe fn dns_resolve_multi_result_with_ep(
+    hostname: &[u8],
+    dnssrv_ep: u64,
+) -> Result<DnsResult, u64> {
     unsafe {
         if hostname.is_empty() || hostname.len() > 120 {
-            return Err(TRONA_INVALID_ARGUMENT);
+            return Err(uapi::KERNITE_ERR_INVALID_ARGUMENT as u64);
         }
 
         let mut msg = TronaMsg::zeroed();
@@ -91,21 +103,23 @@ unsafe fn dns_resolve_multi_result_with_ep(hostname: &[u8], dnssrv_ep: u64) -> R
         ::core::ptr::copy_nonoverlapping(hostname.as_ptr(), dst, hostname.len());
         msg.length = 1 + ((hostname.len() as u64 + 7) / 8);
 
-        let err = crate::ipc_call_retry_idempotent(
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
             dnssrv_ep,
             &raw const msg,
             &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         );
         if err != 0 {
             return Err(err as u64);
         }
-        if reply.label != TRONA_OK {
+        if reply.label != (uapi::KERNITE_OK as u64) {
             return Err(reply.label);
         }
 
         let ip_count = reply.regs[0] as u32;
         if ip_count == 0 {
-            return Err(TRONA_NOT_FOUND);
+            return Err(uapi::KERNITE_ERR_NOT_FOUND as u64);
         }
 
         let count = if ip_count > DNS_MAX_RESULTS as u32 {
@@ -177,7 +191,10 @@ pub unsafe fn dns_resolve(hostname: &[u8]) -> u32 {
 /// Caller must ensure the IPC context is initialized and `dnssrv_ep` is a
 /// valid endpoint capability slot connected to the dnssrv service.
 pub unsafe fn dns_resolve_multi_with_ep(hostname: &[u8], dnssrv_ep: u64) -> DnsResult {
-    unsafe { dns_resolve_multi_result_with_ep(hostname, dnssrv_ep).unwrap_or_else(|_| DnsResult::zeroed()) }
+    unsafe {
+        dns_resolve_multi_result_with_ep(hostname, dnssrv_ep)
+            .unwrap_or_else(|_| DnsResult::zeroed())
+    }
 }
 
 /// Resolve a hostname to up to 4 IPv4 addresses using the default dnssrv
@@ -308,11 +325,11 @@ pub unsafe fn posix_gethostbyname_result(name: *const u8) -> Result<u32, u64> {
     unsafe {
         let hostname = match hostname_from_cstr(name) {
             Some(hostname) => hostname,
-            None => return Err(TRONA_INVALID_ARGUMENT),
+            None => return Err(uapi::KERNITE_ERR_INVALID_ARGUMENT as u64),
         };
         let result = dns_resolve_multi_result(hostname)?;
         if result.count == 0 {
-            Err(TRONA_NOT_FOUND)
+            Err(uapi::KERNITE_ERR_NOT_FOUND as u64)
         } else {
             Ok(result.addrs[0])
         }
@@ -343,12 +360,14 @@ pub unsafe fn dns_reverse_lookup(ip: u32, hostname_out: *mut u8, hostname_max: u
         msg.regs[0] = ip as u64;
         msg.length = 1;
 
-        let err = crate::ipc_call_retry_idempotent(
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
             ep,
             &raw const msg,
             &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         );
-        if err != 0 || reply.label != TRONA_OK {
+        if err != 0 || reply.label != (uapi::KERNITE_OK as u64) {
             return 0;
         }
 
@@ -384,11 +403,12 @@ pub unsafe fn dns_cache_flush() {
         msg.label = DNS_CACHE_FLUSH;
         msg.length = 0;
 
-        let _ = ipc::call_ctx(
+        let _ = ipc::mp_call_ctx(
             tls::current_ipc_ctx(),
             ep,
             &raw const msg,
             &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         );
     }
 }

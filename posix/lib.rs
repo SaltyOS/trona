@@ -3,7 +3,7 @@
 //!
 //! This crate provides POSIX-compatible wrappers built on top of the `trona`
 //! substrate (kernel ABI, IPC, capability invocations). Every POSIX operation
-//! is implemented as an IPC `Call` to a userspace server (VFS, procmgr, mmsrv).
+//! is implemented as an IPC `Call` to a userspace server (VFS, init, mmsrv).
 //!
 //! # Modules
 //!
@@ -13,7 +13,10 @@
 //! - **`pipe`** -- Pipes (pipe, pipe2)
 //! - **`poll`** -- Polling (poll, epoll, select)
 //! - **`mm`** -- Memory management (mmap, munmap, shm)
-//! - **`signals`** -- POSIX signal delivery via notifications
+//! - **`signals`** -- POSIX signal delivery via the per-thread wakeup
+//!   `EventQueue` + signal-pipe `Watch` (see `wakeup`)
+//! - **`wakeup`** -- Per-thread `EventQueue` / `Timer` / signal-pipe
+//!   `Watch` plumbing for sleep + signal dispatch
 //! - **`pthread`** -- POSIX threads (create, join, exit, detach, mutex, key)
 //! - **`tls`** -- Thread-Local Storage block layout and accessors
 //! - **`dns`** -- DNS hostname resolution client
@@ -28,75 +31,161 @@
 
 #![no_std]
 #![allow(internal_features)]
-#![feature(linkage)]
 
-extern crate trona;
+extern crate trona_kernel;
+extern crate trona_protocol;
+extern crate trona_runtime;
+extern crate trona_server;
 
-pub mod consts;
-pub mod protocol;
-pub mod file;
-pub mod socket;
-pub mod poll;
-pub mod pipe;
-pub mod proc;
-pub mod misc;
+use core::sync::atomic::{AtomicU64, Ordering};
+use trona_protocol::common::{
+    TRONA_ALREADY_EXISTS, TRONA_BAD_ADDRESS, TRONA_BUSY, TRONA_CANCELLED, TRONA_DEADLOCK,
+    TRONA_INVALID_ARGUMENT, TRONA_INVALID_CAPABILITY, TRONA_INVALID_OPERATION, TRONA_IO_ERROR,
+    TRONA_NOT_FOUND, TRONA_NOT_SUPPORTED, TRONA_OUT_OF_MEMORY, TRONA_OUT_OF_RANGE,
+    TRONA_PERMISSION_DENIED, TRONA_READONLY, TRONA_TIMED_OUT, TRONA_TOO_LARGE, TRONA_WOULD_BLOCK,
+};
+
 pub mod at;
 pub(crate) mod bulk;
-pub mod mm;
+pub mod consts;
 pub mod dns;
-pub mod signals;
+pub mod file;
+pub mod misc;
+pub mod mm;
+pub mod pipe;
+pub mod poll;
+pub mod proc;
 pub mod pthread;
+pub mod signals;
+pub mod socket;
 pub mod tls;
+pub mod types;
+pub mod wakeup;
 
-pub use file::*;
-pub use socket::*;
-pub use poll::*;
-pub use pipe::*;
-pub use proc::*;
-pub use misc::*;
 pub use at::*;
+pub use file::*;
+pub use misc::*;
+pub use pipe::*;
+pub use poll::*;
+pub use proc::*;
+pub use socket::*;
 
-pub use trona::consts::kernel::*;
-pub use trona::consts::server::*;
-pub use trona::consts::posix::*;
-pub use trona::types::core::*;
-pub use trona::types::posix::*;
+// Substrate-side SaltyOS startup contract types.
+pub use trona_kernel::core_types::*;
+
+// POSIX-personality consts/types live in this crate.
+pub use crate::consts::*;
+pub use crate::types::*;
+pub use trona_protocol::posix::*;
+
+static NEXT_FORK_TXID: AtomicU64 = AtomicU64::new(1);
 
 /// Convert a server error label to a negative POSIX errno code.
+///
+/// The wire labels carried in `TronaMsg.label` come from two namespaces:
+///
+/// - **Kernel ABI** — `KERNITE_OK` / `KERNITE_ERR_*`, defined by the
+///   kernite `uapi` crate. These can appear in the label slot when a
+///   userland server forwards a kernel-level invocation failure to its
+///   client (e.g., mmsrv passing through an underlying retype error).
+/// - **Shared personality wire errors** — `TRONA_*`, defined by
+///   `crate::protocol`. Userland servers (VFS, netsrv, dnssrv) generate
+///   these for personality-level conditions that the kernel ABI does
+///   not name (network, DNS, server-died, stale handle, etc.).
+/// - **VFS public replies** — `VFS_PUBLIC_REPLY_*`, defined by
+///   `trona_protocol::vfs::public`. VFS owns these labels so POSIX,
+///   Win32, and future personalities can share the same backend error
+///   vocabulary without copying constants into each client.
 pub(crate) fn trona_err_to_posix(label: u64) -> i32 {
+    use trona_protocol::vfs::public::*;
+
     match label {
-        TRONA_OK => 0,
-        TRONA_NOT_FOUND => -2,                // ENOENT
-        TRONA_ALREADY_EXISTS => -17,           // EEXIST
-        TRONA_SLOT_OCCUPIED => -17,            // EEXIST
-        TRONA_ALREADY_MAPPED => -17,           // EEXIST
-        TRONA_INVALID_ARGUMENT => -22,         // EINVAL
-        TRONA_OUT_OF_MEMORY => -12,            // ENOMEM
-        TRONA_BUSY => -16,                     // EBUSY
-        TRONA_ALREADY_BOUND => -16,            // EBUSY
-        TRONA_WOULD_BLOCK => -11,              // EAGAIN
-        TRONA_IN_PROGRESS => -115,            // EINPROGRESS
-        TRONA_BAD_ADDRESS => -14,              // EFAULT
-        TRONA_INSUFFICIENT_RIGHTS => -13,      // EACCES
-        TRONA_INVALID_CAPABILITY => -9,        // EBADF
-        TRONA_INTERRUPTED => -4,               // EINTR
-        TRONA_DEADLOCK => -35,                 // EDEADLK
-        TRONA_INVALID_OPERATION => -1,         // EPERM
-        TRONA_OUT_OF_RANGE => -34,             // ERANGE
-        TRONA_CANCELLED => -125,               // ECANCELED
-        TRONA_CONN_REFUSED => -111,            // ECONNREFUSED
-        TRONA_TIMED_OUT => -110,               // ETIMEDOUT
-        TRONA_PROTO_NOT_SUPPORTED => -93,      // EPROTONOSUPPORT
-        TRONA_HOST_UNREACHABLE => -113,        // EHOSTUNREACH
-        TRONA_NET_UNREACHABLE => -101,         // ENETUNREACH
-        TRONA_NO_BUFS => -105,                 // ENOBUFS
-        TRONA_CONN_RESET => -104,              // ECONNRESET
-        TRONA_NOT_CONNECTED => -107,           // ENOTCONN
-        TRONA_IS_CONNECTED => -106,            // EISCONN
-        TRONA_ADDR_IN_USE => -98,              // EADDRINUSE
-        TRONA_DNS_NXDOMAIN => -2,              // ENOENT
-        TRONA_DNS_SERVER_FAIL => -5,           // EIO
-        _ => -5,                               // EIO (generic)
+        // Kernel ABI namespace.
+        x if x == uapi::KERNITE_OK as u64 => 0,
+        x if x == uapi::KERNITE_ERR_NOT_FOUND as u64 => -2, // ENOENT
+        x if x == uapi::KERNITE_ERR_ALREADY_EXISTS as u64 => -17, // EEXIST
+        x if x == uapi::KERNITE_ERR_SLOT_OCCUPIED as u64 => -17, // EEXIST
+        x if x == uapi::KERNITE_ERR_ALREADY_MAPPED as u64 => -17, // EEXIST
+        x if x == uapi::KERNITE_ERR_INVALID_ARGUMENT as u64 => -22, // EINVAL
+        x if x == uapi::KERNITE_ERR_OUT_OF_MEMORY as u64 => -12, // ENOMEM
+        x if x == uapi::KERNITE_ERR_BUSY as u64 => -16,     // EBUSY
+        x if x == uapi::KERNITE_ERR_WOULD_BLOCK as u64 => -11, // EAGAIN
+        x if x == uapi::KERNITE_ERR_BAD_ADDRESS as u64 => -14, // EFAULT
+        x if x == uapi::KERNITE_ERR_INSUFFICIENT_RIGHTS as u64 => -13, // EACCES
+        x if x == uapi::KERNITE_ERR_INVALID_CAPABILITY as u64 => -9, // EBADF
+        x if x == uapi::KERNITE_ERR_INTERRUPTED as u64 => -4, // EINTR
+        x if x == uapi::KERNITE_ERR_DEADLOCK as u64 => -35, // EDEADLK
+        x if x == uapi::KERNITE_ERR_INVALID_OPERATION as u64 => -1, // EPERM
+        x if x == uapi::KERNITE_ERR_OUT_OF_RANGE as u64 => -34, // ERANGE
+        x if x == uapi::KERNITE_ERR_CANCELLED as u64 => -125, // ECANCELED
+        x if x == uapi::KERNITE_ERR_TIMED_OUT as u64 => -110, // ETIMEDOUT
+
+        // Personality wire-error namespace.
+        TRONA_INVALID_CAPABILITY => -9,   // EBADF
+        TRONA_INVALID_OPERATION => -1,    // EPERM
+        TRONA_PERMISSION_DENIED => -13,   // EACCES
+        TRONA_INVALID_ARGUMENT => -22,    // EINVAL
+        TRONA_OUT_OF_MEMORY => -12,       // ENOMEM
+        TRONA_NOT_FOUND => -2,            // ENOENT
+        TRONA_BUSY => -16,                // EBUSY
+        TRONA_ALREADY_EXISTS => -17,      // EEXIST
+        TRONA_WOULD_BLOCK => -11,         // EAGAIN
+        TRONA_BAD_ADDRESS => -14,         // EFAULT
+        TRONA_OUT_OF_RANGE => -34,        // ERANGE
+        TRONA_CANCELLED => -125,          // ECANCELED
+        TRONA_DEADLOCK => -35,            // EDEADLK
+        TRONA_TIMED_OUT => -110,          // ETIMEDOUT
+        TRONA_TOO_LARGE => -7,            // E2BIG
+        TRONA_NOT_SUPPORTED => -95,       // EOPNOTSUPP
+        TRONA_READONLY => -30,            // EROFS
+        TRONA_IO_ERROR => -5,             // EIO
+        TRONA_ALREADY_BOUND => -16,       // EBUSY
+        TRONA_IN_PROGRESS => -115,        // EINPROGRESS
+        TRONA_CONN_REFUSED => -111,       // ECONNREFUSED
+        TRONA_PROTO_NOT_SUPPORTED => -93, // EPROTONOSUPPORT
+        TRONA_HOST_UNREACHABLE => -113,   // EHOSTUNREACH
+        TRONA_NET_UNREACHABLE => -101,    // ENETUNREACH
+        TRONA_NO_BUFS => -105,            // ENOBUFS
+        TRONA_CONN_RESET => -104,         // ECONNRESET
+        TRONA_NOT_CONNECTED => -107,      // ENOTCONN
+        TRONA_IS_CONNECTED => -106,       // EISCONN
+        TRONA_ADDR_IN_USE => -98,         // EADDRINUSE
+        TRONA_DNS_NXDOMAIN => -2,         // ENOENT
+        TRONA_DNS_SERVER_FAIL => -5,      // EIO
+        TRONA_CROSS_DEVICE => -18,        // EXDEV
+        TRONA_STALE => -116,              // ESTALE
+        TRONA_NO_SPACE => -28,            // ENOSPC
+        TRONA_SERVER_DIED => -107,        // ENOTCONN (peer permanently gone)
+
+        // VFS public-reply namespace.
+        VFS_PUBLIC_REPLY_OK => 0,
+        VFS_PUBLIC_REPLY_BAD_F => -9,               // EBADF
+        VFS_PUBLIC_REPLY_NOT_FOUND => -2,           // ENOENT
+        VFS_PUBLIC_REPLY_PERM => -13,               // EACCES
+        VFS_PUBLIC_REPLY_BUSY => -16,               // EBUSY
+        VFS_PUBLIC_REPLY_IO_ERROR => -5,            // EIO
+        VFS_PUBLIC_REPLY_INVALID => -22,            // EINVAL
+        VFS_PUBLIC_REPLY_NO_MEM => -12,             // ENOMEM
+        VFS_PUBLIC_REPLY_LOOP => -40,               // ELOOP
+        VFS_PUBLIC_REPLY_NAME_TOO_LONG => -36,      // ENAMETOOLONG
+        VFS_PUBLIC_REPLY_NOT_DIR => -20,            // ENOTDIR
+        VFS_PUBLIC_REPLY_IS_DIR => -21,             // EISDIR
+        VFS_PUBLIC_REPLY_NOT_EMPTY => -39,          // ENOTEMPTY
+        VFS_PUBLIC_REPLY_X_DEV => -18,              // EXDEV
+        VFS_PUBLIC_REPLY_RO_FS => -30,              // EROFS
+        VFS_PUBLIC_REPLY_NOT_SUPPORTED => -95,      // EOPNOTSUPP
+        VFS_PUBLIC_REPLY_AGAIN => -11,              // EAGAIN
+        VFS_PUBLIC_REPLY_INTR => -4,                // EINTR
+        VFS_PUBLIC_REPLY_TIMED_OUT => -110,         // ETIMEDOUT
+        VFS_PUBLIC_REPLY_QUOTA => -122,             // EDQUOT
+        VFS_PUBLIC_REPLY_EXIST => -17,              // EEXIST
+        VFS_PUBLIC_REPLY_SESSION_TORN_DOWN => -107, // ENOTCONN
+        VFS_PUBLIC_REPLY_PREDECESSOR_FAILED => -5,  // EIO
+        VFS_PUBLIC_REPLY_STALE_INCARNATION => -116, // ESTALE
+        VFS_PUBLIC_REPLY_NOT_TTY => -25,            // ENOTTY
+        VFS_PUBLIC_REPLY_RANGE => -34,              // ERANGE
+
+        _ => -5, // EIO (generic)
     }
 }
 
@@ -110,67 +199,13 @@ pub(crate) fn call_err_to_posix_i64(err: i32) -> i64 {
     call_err_to_posix(err) as i64
 }
 
-/// IPC call with retry only when the server never received the request.
-///
-/// Retries on `TRONA_RESTART` (CallSendBlocked interruption — server
-/// never saw the message, safe to re-send). Returns `TRONA_INTERRUPTED`
-/// as-is (ReplyWait interruption — server already processed the request,
-/// re-sending may cause duplicates for non-idempotent operations).
-///
-/// Use for non-idempotent operations: open, close, pipe, dup, socket,
-/// bind, mkdir, unlink, rename, etc.
-pub(crate) unsafe fn ipc_call_retry(
-    ep: u64,
-    msg: *const trona::types::core::TronaMsg,
-    reply: *mut trona::types::core::TronaMsg,
-) -> i32 {
-    unsafe {
-        loop {
-            let err = trona::ipc::call_ctx(
-                crate::tls::current_ipc_ctx(),
-                ep,
-                msg,
-                reply,
-            );
-            if err == trona::consts::kernel::TRONA_RESTART as i32 {
-                continue;
-            }
-            return err;
-        }
-    }
-}
-
-/// IPC call with retry on any signal interruption.
-///
-/// Retries on both `TRONA_RESTART` (CallSendBlocked) and
-/// `TRONA_INTERRUPTED` (ReplyWait). Safe only for idempotent read-only
-/// operations where re-sending has no side effects: stat, fstat, getpid,
-/// getuid, getcwd, access, lseek, etc.
-pub(crate) unsafe fn ipc_call_retry_idempotent(
-    ep: u64,
-    msg: *const trona::types::core::TronaMsg,
-    reply: *mut trona::types::core::TronaMsg,
-) -> i32 {
-    unsafe {
-        loop {
-            let err = trona::ipc::call_ctx(
-                crate::tls::current_ipc_ctx(),
-                ep,
-                msg,
-                reply,
-            );
-            if err == trona::consts::kernel::TRONA_RESTART as i32
-                || err == trona::consts::kernel::TRONA_INTERRUPTED as i32
-            {
-                continue;
-            }
-            return err;
-        }
-    }
-}
-
 /// Pack a null-terminated path into message registers starting at `offset`.
-pub(crate) unsafe fn pack_path(msg: *mut TronaMsg, offset: usize, path: *const u8, max_len: usize) -> u8 {
+pub(crate) unsafe fn pack_path(
+    msg: *mut trona_kernel::core_types::TronaMsg,
+    offset: usize,
+    path: *const u8,
+    max_len: usize,
+) -> u8 {
     unsafe {
         let avail = (20usize.saturating_sub(offset + 1)) * 8;
         let cap = if max_len < 128 { max_len } else { 128 };
@@ -195,7 +230,7 @@ pub(crate) unsafe fn pack_path(msg: *mut TronaMsg, offset: usize, path: *const u
 // Signal global state
 // ---------------------------------------------------------------------------
 
-// NSIG is already in scope from `pub use trona::consts::posix::*;` above
+// NSIG is already in scope from `pub use crate::consts::*;` above.
 
 /// Per-signal handler function pointers (indexed by signal number).
 /// `SIG_DFL` (0) and `SIG_IGN` (1) are special sentinel values.
@@ -205,7 +240,18 @@ pub static __sig_handlers: [::core::sync::atomic::AtomicUsize; NSIG] =
 
 /// Atomic flag: 1 once signal infrastructure has been initialized.
 #[unsafe(no_mangle)]
-pub static __sig_initialized: ::core::sync::atomic::AtomicI32 = ::core::sync::atomic::AtomicI32::new(0);
+pub static __sig_initialized: ::core::sync::atomic::AtomicI32 =
+    ::core::sync::atomic::AtomicI32::new(0);
+
+/// Per-process pending-signal bitmask. Bit `N` set ⇒ signal `N` has
+/// been delivered by init via the signal `MessagePipe` and not yet
+/// dispatched. The wakeup-EQ Watch on `signal_pipe.STATE_READABLE`
+/// drives `wakeup::drain_signal_pipe()` which OR-folds incoming
+/// signal numbers into this word; `posix_sigcheck` swaps the word to
+/// 0 to consume them in a single atomic operation.
+#[unsafe(no_mangle)]
+pub static __sig_pending_bits: ::core::sync::atomic::AtomicU64 =
+    ::core::sync::atomic::AtomicU64::new(0);
 
 /// Bitmask of currently blocked signals (bit N = signal N blocked).
 #[unsafe(no_mangle)]
@@ -219,9 +265,11 @@ pub static mut __sig_sa_mask: [u32; NSIG] = [0; NSIG];
 #[unsafe(no_mangle)]
 pub static mut __sig_sa_flags: [i32; NSIG] = [0; NSIG];
 
-/// Set by `__signal_dispatcher` after delivering signals.
-/// `true` if ALL delivered signals had SA_RESTART set.
-/// POSIX wrappers check this to decide whether to retry after EINTR.
+/// Set by `signals::dispatch_pending_bits` after delivering signals
+/// from the wakeup-EQ drain in `posix_sigcheck` (or from a sleep
+/// loop's signal-record dispatch). `true` iff every dispatched
+/// signal had `SA_RESTART` set — POSIX wrappers test this to decide
+/// whether to retry after EINTR.
 #[unsafe(no_mangle)]
 pub static mut __sig_last_restart: bool = false;
 
@@ -235,16 +283,16 @@ pub static mut __sig_last_restart: bool = false;
 /// (r15, r14, r13, r12, rbx, rbp, return RIP) saved by the assembly stub.
 /// When userland SSE2 is enabled, a 256-byte XMM0-15 save block lives below
 /// `saved_rsp` and is restored by the parent return path and `fork_child_entry`.
-/// These are packed into an IPC message to procmgr so it can configure the
+/// These are packed into an IPC message to init so it can configure the
 /// child thread's register state. Returns the child PID (>0) in the parent,
 /// or -1 on failure. The child resumes at `child_entry` (never returns here).
 #[unsafe(no_mangle)]
 pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
-    use trona::consts::kernel::*;
-    use trona::protocol::*;
-    use trona::types::core::*;
+    use trona_kernel::core_types::TronaMsg;
+    use trona_protocol::posix::INIT_FORK;
 
     if saved_rsp == 0 || child_entry == 0 {
+        trona_runtime::debug::serial::serial_puts(b"[FORK_IMPL] invalid args, returning -1\n");
         return -1;
     }
 
@@ -253,7 +301,8 @@ pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
 
         let mut msg = TronaMsg::zeroed();
         let mut reply = TronaMsg::zeroed();
-        msg.label = PM_FORK;
+        let fork_txid = NEXT_FORK_TXID.fetch_add(1, Ordering::Relaxed);
+        msg.label = INIT_FORK;
         msg.regs[0] = saved_rsp;
         msg.regs[1] = child_entry;
 
@@ -273,30 +322,38 @@ pub extern "C" fn _posix_fork_impl(saved_rsp: u64, child_entry: u64) -> i32 {
             msg.length = 9;
             msg.regs[2] = *saved.add(18); // x29 (FP)
             msg.regs[3] = *saved.add(19); // x30 (LR / return address)
-            msg.regs[4] = *saved.add(8);  // x19
-            msg.regs[5] = *saved.add(9);  // x20
+            msg.regs[4] = *saved.add(8); // x19
+            msg.regs[5] = *saved.add(9); // x20
             msg.regs[6] = *saved.add(10); // x21
             msg.regs[7] = *saved.add(11); // x22
             msg.regs[8] = *saved.add(19); // x30 (return address)
         }
 
-        // Pass parent's TLS base so procmgr can set FS_BASE on the child TCB.
+        // Pass parent's TLS base so init can set FS_BASE on the child TCB.
         let tls_base: u64 = match tls::current_tls() {
             Some(ptr) => ptr as u64,
             None => 0,
         };
         msg.regs[9] = tls_base;
-        msg.length = 10;
+        msg.regs[10] = fork_txid;
+        msg.length = 11;
 
-        let err = crate::ipc_call_retry(
-            trona::caps::procmgr_ep(),
+        // Single blocking MP_CALL — no re-send loop. Re-sending a fork request
+        // under the kernel's register-at-send reply-wait would issue a duplicate
+        // fork; the kernel re-waits internally and owns resume.
+        let err = trona_kernel::ipc::mp_call_ctx(
+            crate::tls::current_ipc_ctx(),
+            trona_runtime::client::caps::init_ep().addr(),
             &raw const msg,
             &raw mut reply,
+            trona_kernel::ipc::IPC_TIMEOUT_BLOCK_FOREVER,
         );
-        if err != 0 || reply.label != TRONA_OK {
+        if err != 0 || reply.label != (uapi::KERNITE_OK as u64) {
+            trona_runtime::debug::serial::serial_puts(
+                b"[FORK_IMPL] err/non-OK label, returning -1\n",
+            );
             return -1;
         }
-
         reply.regs[0] as i32
     }
 }
@@ -336,8 +393,13 @@ pub extern "C" fn trona_shutdown(fd: i32, how: i32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_socketpair(fds: *mut i32) -> i32 {
-    unsafe { socket::posix_socketpair(fds) }
+pub extern "C" fn trona_socketpair(
+    domain: i32,
+    sock_type: i32,
+    protocol: i32,
+    fds: *mut i32,
+) -> i32 {
+    unsafe { socket::posix_socketpair(domain, sock_type, protocol, fds) }
 }
 
 #[unsafe(no_mangle)]
@@ -346,8 +408,8 @@ pub extern "C" fn trona_posix_poll(fds: *mut PollFd, nfds: u32, timeout: i32) ->
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_shm_open(name: *const u8, flags: i32) -> i32 {
-    unsafe { misc::posix_shm_open(name, flags) }
+pub extern "C" fn trona_shm_open(name: *const u8, flags: i32, mode: u32) -> i32 {
+    unsafe { misc::posix_shm_open(name, flags, mode) }
 }
 
 #[unsafe(no_mangle)]
@@ -397,6 +459,11 @@ pub extern "C" fn trona_dup3(oldfd: i32, newfd: i32, flags: i32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn trona_mkfifo(path: *const u8, mode: u32) -> i32 {
     unsafe { pipe::posix_mkfifo(path, mode) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn trona_mknod(path: *const u8, mode: u32, dev: u64) -> i32 {
+    unsafe { at::posix_mknodat(consts::AT_FDCWD, path, mode, dev) }
 }
 
 // ---------------------------------------------------------------------------
@@ -453,17 +520,20 @@ pub extern "C" fn trona_getgroups(size: i32, list: *mut i32) -> i32 {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_clock_gettime(clock_id: i32, ts: *mut trona::types::core::Timespec) -> i32 {
+pub extern "C" fn trona_clock_gettime(clock_id: i32, ts: *mut crate::types::Timespec) -> i32 {
     unsafe { proc::posix_clock_gettime(clock_id, ts) }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_gettimeofday(tv: *mut trona::types::core::Timeval) -> i32 {
+pub extern "C" fn trona_gettimeofday(tv: *mut crate::types::Timeval) -> i32 {
     unsafe { proc::posix_gettimeofday(tv) }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_nanosleep(req: *const trona::types::core::Timespec, rem: *mut trona::types::core::Timespec) -> i32 {
+pub extern "C" fn trona_nanosleep(
+    req: *const crate::types::Timespec,
+    rem: *mut crate::types::Timespec,
+) -> i32 {
     unsafe { proc::posix_nanosleep(req, rem) }
 }
 
@@ -498,12 +568,7 @@ pub extern "C" fn trona_epoll_create1(flags: i32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trona_epoll_ctl(
-    epfd: i32,
-    op: i32,
-    fd: i32,
-    event: *const EpollEvent,
-) -> i32 {
+pub extern "C" fn trona_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> i32 {
     unsafe {
         let (events, data) = if !event.is_null() {
             ((*event).events, (*event).data)
@@ -620,7 +685,9 @@ pub extern "C" fn trona_dns_resolve_multi(
     }
     let slice = unsafe { ::core::slice::from_raw_parts(hostname, hostname_len) };
     let r = unsafe { dns::dns_resolve_multi(slice) };
-    unsafe { *result = r; }
+    unsafe {
+        *result = r;
+    }
     if r.count == 0 { -1 } else { 0 }
 }
 
